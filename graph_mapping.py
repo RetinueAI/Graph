@@ -4,7 +4,7 @@ import asyncio
 import uuid
 from typing import Dict, Tuple
 
-from geo_graph import Graph, Node, Edge, GraphSync
+from geo_graph import Graph, Node, Edge, GraphSync, GraphRandomizer, GraphPresenter
 from mongo import MongoHandler
 
 
@@ -106,46 +106,50 @@ async def main():
     connection = await mongo_handler.test_database_connection()
     print(f"Connection: {connection}")
 
-    count = check_mapping(graph=graph, graph_map=graph_sync.graph_map[graph_sync.graph.id])
+    randomizer = GraphRandomizer()
 
-    print(count)
+    randomizer.simulate_usage_recursive(graph=graph, days=180, max_daily_interactions=60)
 
-    graphs = graph_sync.collect_graphs(graph_sync.graph)
+    presenter = GraphPresenter()
 
-    print(len(graphs))
+    presenter.display_simulation_results(graph=graph)
 
-    map_insert = await graph_sync.save_map_to_database()
-    print(f'Map saved: {map_insert.acknowledged}')
+    # graphs = graph_sync.collect_graphs(graph_sync.graph)
 
-    graphs_insert = await graph_sync.save_graphs_to_database(graph_sync.graph)
-    print(f'Graphs saved: {graphs_insert.acknowledged}')
+    # print(len(graphs))
 
-    loaded_map = await graph_sync.load_graph_map_from_database()
-    print(loaded_map == graph_map)
+    # map_insert = await graph_sync.save_map_to_database()
+    # print(f'Map saved: {map_insert.acknowledged}')
 
-    try: 
-        print('Loading graph')
-        loaded_graph = await graph_sync.load_graphs_from_database(user_id=user_id)
+    # graphs_insert = await graph_sync.save_graphs_to_database(graph_sync.graph)
+    # print(f'Graphs saved: {graphs_insert.acknowledged}')
 
-        print(f'Loaded Graph: {loaded_graph}')
+    # loaded_map = await graph_sync.load_graph_map_from_database()
+    # print(loaded_map == graph_map)
 
-        print(f"Number of loaded root nodes: {len(graph_sync.graph.nodes)}")
+    # try: 
+    #     print('Loading graph')
+    #     loaded_graph = await graph_sync.load_graphs_from_database(user_id=user_id)
 
-        count = check_mapping(graph=graph_sync.graph, graph_map=graph_sync.graph_map[graph_sync.graph.id])
+    #     print(f'Loaded Graph: {loaded_graph}')
 
-        print(count)
+    #     print(f"Number of loaded root nodes: {len(graph_sync.graph.nodes)}")
 
-        state = compare_graphs(x=graph, y=graph_sync.graph)
+    #     count = check_mapping(graph=graph_sync.graph, graph_map=graph_sync.graph_map[graph_sync.graph.id])
 
-        print(f"Node names are identical: {state}")
+    #     print(count)
 
-    except Exception as e:
-        print(f'Error loading graph: {e}')
-        pass
+    #     state = compare_graphs(x=graph, y=graph_sync.graph)
 
-    graphs_deleted = await mongo_handler.delete_documents(db_name='Graph', collection_name='Graphs', filter={'graph.user_id': graph.user_id})
+    #     print(f"Node names are identical: {state}")
 
-    print(f'Graphs deleted: {graphs_deleted}')
+    # except Exception as e:
+    #     print(f'Error loading graph: {e}')
+    #     pass
+
+    # graphs_deleted = await mongo_handler.delete_documents(db_name='Graph', collection_name='Graphs', filter={'graph.user_id': graph.user_id})
+
+    # print(f'Graphs deleted: {graphs_deleted}')
 
 if __name__ == "__main__":
     asyncio.run(main())

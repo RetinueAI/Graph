@@ -1,10 +1,12 @@
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dateutil import parser
 import os
 import json
 from typing import Dict, Optional, List, Tuple, Any
 import uuid
+import random
 
+import numpy as np
 import torch
 from torch_geometric.data import Data
 from torch_geometric.utils import to_dense_adj
@@ -181,7 +183,23 @@ class Graph(BaseModel):
 
     def calculate_eigenvector_centrality(self):
         nx_graph = self.to_networkx()
-        centrality = nx.eigenvector_centrality_numpy(nx_graph)
+        num_nodes = nx_graph.number_of_nodes()
+        
+        if num_nodes < 3:
+            # For very small graphs, assign equal centrality to all nodes
+            centrality = {node: 1.0 / num_nodes for node in nx_graph.nodes()}
+        else:
+            try:
+                # Try using eigenvector_centrality_numpy
+                centrality = nx.eigenvector_centrality_numpy(nx_graph)
+            except (TypeError, np.linalg.LinAlgError):
+                # If that fails, fall back to power iteration method
+                try:
+                    centrality = nx.eigenvector_centrality(nx_graph, max_iter=1000)
+                except nx.PowerIterationFailedConvergence:
+                    # If power iteration fails, use degree centrality as an approximation
+                    centrality = nx.degree_centrality(nx_graph)
+        
         for node_id, centrality_value in centrality.items():
             self.nodes[node_id].eigenvector_centrality = centrality_value
         self._update_pyg_data()
@@ -422,3 +440,97 @@ class GraphSync(BaseModel):
                 raise
 
             await self.reconstruct_graph(graph=graph.nodes[int(node)].subgraph, graphs=graphs, graph_map=graph_map[node][graph_id])
+
+
+class GraphRandomizer(BaseModel):
+    graph_ids: List = Field(default=[])
+
+    def simulate_usage(self, graph: Graph, days=30, max_daily_interactions=10):
+        start_date = datetime.now(timezone.utc) - timedelta(days=days)
+        for _ in range(days):
+            start_date += timedelta(days=1)
+            daily_interactions = random.randint(1, max_daily_interactions)
+            
+            for _ in range(daily_interactions):
+                # Randomly select a node to update
+                node = random.choice(list(graph.nodes.values()))
+                graph.update_node_engagement(node.id)
+                node.last_engagement = start_date
+                
+                # Randomly update an edge if it exists
+                if graph.edges:
+                    edge = random.choice(list(graph.edges.values()))
+                    graph.update_edge_interaction(edge.from_node, edge.to_node)
+                    edge.last_interaction = start_date
+                    
+                    # Update contextual similarity and sequential relation
+                    edge.contextual_similarity = min(1.0, edge.contextual_similarity + random.uniform(0, 0.1))
+                    edge.sequential_relation = min(1.0, edge.sequential_relation + random.uniform(0, 0.1))
+            
+            # Recalculate centrality measures
+            graph.calculate_eigenvector_centrality()
+        
+        # Update engagement scores for all nodes
+        for node in graph.nodes.values():
+            node.update_engagement_score()
+
+    def simulate_usage_recursive(self, graph: Graph, days=30, max_daily_interactions=10):
+        self.simulate_usage(graph=graph, days=days, max_daily_interactions=max_daily_interactions)
+        for node in graph.nodes.values():
+            if node.subgraph:
+                self.simulate_usage_recursive(graph=node.subgraph, days=days, max_daily_interactions=max_daily_interactions)
+
+
+class GraphPresenter(BaseModel):
+    def display_simulation_results(self, graph: Graph, indent: int = 0, max_depth: Optional[int] = None):
+        self._display_graph(graph=graph, indent=indent, max_depth=max_depth)
+        self._display_summary_statistics(graph=graph, indent=indent)
+
+
+    def _display_graph(self, graph: Graph, indent: int = 0, max_depth: Optional[int] = None):
+        prefix = "  " * indent
+        print(f"{prefix}Graph ID: {graph.id}")
+        print(f"{prefix}Number of nodes: {len(graph.nodes)}")
+        print(f"{prefix}Number of edges: {len(graph.edges)}")
+        print(f"{prefix}Nodes:")
+        
+        for node_id, node in graph.nodes.items():
+            print(f"{prefix}  Node {node_id}: {node.name}")
+            print(f"{prefix}    Interest Frequency: {node.interest_frequency}")
+            print(f"{prefix}    Eigenvector Centrality: {node.eigenvector_centrality:.4f}")
+            print(f"{prefix}    Last Engagement: {node.last_engagement}")
+            print(f"{prefix}    Engagement Score: {node.engagement_score:.4f}")
+            
+            if node.subgraph and (max_depth is None or indent < max_depth):
+                print(f"{prefix}    Subgraph:")
+                self._display_graph(graph=node.subgraph, indent=indent + 3, max_depth=max_depth)
+        
+        print(f"{prefix}Edges:")
+        for (from_node, to_node), edge in graph.edges.items():
+            print(f"{prefix}  Edge {from_node} -> {to_node}:")
+            print(f"{prefix}    Interaction Strength: {edge.interaction_strength}")
+            print(f"{prefix}    Last Interaction: {edge.last_interaction}")
+            print(f"{prefix}    Contextual Similarity: {edge.contextual_similarity:.4f}")
+            print(f"{prefix}    Sequential Relation: {edge.sequential_relation:.4f}")
+        
+        print()  # Add a blank line for readability
+
+
+    def _display_summary_statistics(self, graph: Graph, indent: int = 0):
+        prefix = "  " * indent
+        print(f"{prefix}Summary Statistics:")
+        
+        # Calculate average engagement score
+        avg_engagement = sum(node.engagement_score for node in graph.nodes.values()) / len(graph.nodes)
+        print(f"{prefix}  Average Engagement Score: {avg_engagement:.4f}")
+        
+        # Find most active node
+        most_active_node = max(graph.nodes.values(), key=lambda n: n.interest_frequency)
+        print(f"{prefix}  Most Active Node: {most_active_node.name} (ID: {most_active_node.id})")
+        
+        # Calculate average edge interaction strength
+        if graph.edges:
+            avg_interaction = sum(edge.interaction_strength for edge in graph.edges.values()) / len(graph.edges)
+            print(f"{prefix}  Average Edge Interaction Strength: {avg_interaction:.2f}")
+        
+        print()  # Add a blank line for readability
