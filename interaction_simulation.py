@@ -1,6 +1,8 @@
 import json
 import asyncio
 from typing import Dict, List
+import random
+from time import time
 
 from geo_graph import Graph, Node
 
@@ -29,14 +31,38 @@ def generate_node_name_map(graph: Graph, map: Dict):
             generate_node_name_map(node.subgraph, map)
 
 
-def graph_interaction_update(node: Node, node_map: Dict[str,int], sub_cats: List[str] = None):
-    node.interest_frequency += 1
+def graph_interaction_update(graph: Graph, result: List[str]):
+    category = result[0].replace('\n','')
+    for node in graph.nodes.values():
+        if node.name == category:
+            node.interest_frequency += 1
 
-    if sub_cats:
+            if len(result) > 1:
+                graph_interaction_update(graph=node.subgraph, result=result[1:])
+
+            break
+
+
+def check_engagement(graph: Graph, indentation_level: int = 0):
+    indentation = indentation_level * '\t'
+    for node in graph.nodes.values():
+        if node.interest_frequency > 0:
+            print(f"{indentation}{node.name}")
+            print(f"{indentation}Interactions: {node.interest_frequency}")
+
+            if node.subgraph:
+                new_indentation_level = indentation_level + 1
+                check_engagement(graph=node.subgraph, indentation_level=new_indentation_level)
+
+
+def simulate_interactions(graph: Graph, category_list: List[str], n: int = 0):
+    for i in range(n):
+        categories = random.choice(category_list)
+        categories = categories.split('/')[1:]
+
         graph_interaction_update(
-            node=node.subgraph.nodes[node_map[sub_cats[0].replace('\n','')]],
-            node_map=node_map,
-            sub_cats=sub_cats[1:] if len(sub_cats) > 1 else None
+            graph=graph, 
+            result=categories,
         )
 
 
@@ -54,22 +80,22 @@ async def main():
     with open('categories.json', 'r') as f:
         categories = json.load(f)
 
+    before_generation = time()
     generate_graph(graph=graph, categories=categories)
+    after_generation = time()
 
-    node_name_map = {}
+    print("Graph generated")
 
-    generate_node_name_map(graph=graph, map=node_name_map)
+    n = 1_000_000
+    before_simulation = time()
+    simulate_interactions(graph=graph, category_list=categoriy_list, n=n)
+    after_simulation = time()
 
-    for cats in categoriy_list:
-        valid_categoris = cats.split('/')[1:]
-        graph_interaction_update(
-            node=graph.nodes[node_name_map[valid_categoris[0].replace('\n','')]],
-            node_map=node_name_map,
-            sub_cats=valid_categoris[1:] if len(valid_categoris) > 1 else None,
-        )
+    # check_engagement(graph=graph)
 
-    print(graph.nodes[1].interest_frequency)
-
+    print(f"Graph generation took: {after_generation - before_generation}s")
+    print(f"Number of interactions: {n}")
+    print(f"Interaction simulation took: {after_simulation - before_simulation}s")
 
 if __name__ == "__main__":
     asyncio.run(main())
