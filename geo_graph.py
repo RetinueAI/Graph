@@ -2,7 +2,7 @@ from datetime import datetime, timezone, timedelta
 from dateutil import parser
 import os
 import json
-from typing import Dict, Optional, List, Tuple, Any
+from typing import Dict, Optional, List, Tuple, Any, Union
 import uuid
 import random
 
@@ -29,6 +29,17 @@ class RecursiveData(Data):
         if key == 'subgraphs':
             return {k: 0 for k in self.subgraphs.keys()}
         return super().__inc__(key, value, *args, **kwargs)
+
+
+class GlobalNodeID(BaseModel):
+    path: List[Union[str, int]]
+
+    def __str__(self):
+        return ".".join(map(str, self.path))
+
+    @classmethod
+    def from_string(cls, s: str):
+        return cls([int(x) if x.isdigit() else x for x in s.split(".")])
 
 
 class Node(BaseModel):
@@ -79,6 +90,14 @@ class Edge(BaseModel):
             self.sequential_relation,
             (datetime.now(timezone.utc) - self.last_interaction).total_seconds()
         ]
+    
+
+class CrossHierarchyEdge(Edge):
+    def __init__(self, from_node: GlobalNodeID, to_node: GlobalNodeID, **kwargs):
+        super().__init__(from_node=str(from_node), to_node=str(to_node), **kwargs)
+        self.from_node_global = from_node
+        self.to_node_global = to_node
+
 
 class Graph(BaseModel):
     version: int = 1
@@ -87,6 +106,9 @@ class Graph(BaseModel):
     nodes: Dict[int, Node] = Field(default_factory=dict)
     edges: Dict[Tuple[int, int], Edge] = Field(default_factory=dict)
     pyg_data: Optional[RecursiveData] = None
+    cross_hierarchy_edges: Dict[Tuple[str, str], CrossHierarchyEdge] = Field(default_factory=dict)
+    parent: Optional['Graph'] = None
+    depth: int = 0
 
     class Config:
         arbitrary_types_allowed = True
@@ -133,76 +155,91 @@ class Graph(BaseModel):
             self.edges[edge_key].update_interaction()
             self._update_pyg_data()
 
-    def calculate_eigenvector_centrality_pyg(self, max_iterations=100, tolerance=1e-6):
-        def calculate_for_graph(graph):
-            # Convert edge_index to dense adjacency matrix
-            adj_matrix = to_dense_adj(graph.edge_index)[0]
-            
-            # Initialize centrality vector
-            centrality = torch.ones(graph.num_nodes, device=graph.x.device)
-            
-            for _ in range(max_iterations):
-                prev_centrality = centrality.clone()
-                
-                # Compute new centrality
-                centrality = torch.matmul(adj_matrix, centrality)
-                
-                # Normalize
-                centrality = centrality / centrality.norm(p=2)
-                
-                # Check for convergence
-                if torch.allclose(centrality, prev_centrality, rtol=tolerance):
-                    break
-            
-            return centrality
+    def add_cross_hierarchy_edge(self, from_node: GlobalNodeID, to_node: GlobalNodeID) -> CrossHierarchyEdge:
+        edge = CrossHierarchyEdge(from_node=from_node, to_node=to_node)
+        self.cross_hierarchy_edges[(str(from_node), str(to_node))] = edge
+        return edge
+    
+    def resolve_global_node_id(self, global_id: GlobalNodeID) -> Optional[Node]:
+        if len(global_id.path) == 1:
+            return self.nodes.get(global_id.path[0])
+        
+        next_subgraph = self.nodes.get(global_id.path[0])
+        if next_subgraph and next_subgraph.subgraph:
+            return next_subgraph.subgraph.resolve_global_node_id(GlobalNodeID(global_id.path[1:]))
+        
+        return None
 
-        def recursive_centrality(graph):
-            # Calculate centrality for current graph
-            centrality = calculate_for_graph(graph)
+    # def calculate_eigenvector_centrality_pyg(self, max_iterations=100, tolerance=1e-6):
+    #     def calculate_for_graph(graph):
+    #         # Convert edge_index to dense adjacency matrix
+    #         adj_matrix = to_dense_adj(graph.edge_index)[0]
             
-            # Update node features with centrality
-            graph.x[:, 1] = centrality  # Assuming eigenvector_centrality is the second feature
+    #         # Initialize centrality vector
+    #         centrality = torch.ones(graph.num_nodes, device=graph.x.device)
+            
+    #         for _ in range(max_iterations):
+    #             prev_centrality = centrality.clone()
+                
+    #             # Compute new centrality
+    #             centrality = torch.matmul(adj_matrix, centrality)
+                
+    #             # Normalize
+    #             centrality = centrality / centrality.norm(p=2)
+                
+    #             # Check for convergence
+    #             if torch.allclose(centrality, prev_centrality, rtol=tolerance):
+    #                 break
+            
+    #         return centrality
 
-            # Recursively calculate for subgraphs
-            for node_id, subgraph in graph.subgraphs.items():
-                if subgraph is not None:
-                    recursive_centrality(subgraph)
+    #     def recursive_centrality(graph):
+    #         # Calculate centrality for current graph
+    #         centrality = calculate_for_graph(graph)
+            
+    #         # Update node features with centrality
+    #         graph.x[:, 1] = centrality  # Assuming eigenvector_centrality is the second feature
+
+    #         # Recursively calculate for subgraphs
+    #         for node_id, subgraph in graph.subgraphs.items():
+    #             if subgraph is not None:
+    #                 recursive_centrality(subgraph)
                     
-                    # Propagate subgraph centrality to parent graph
-                    subgraph_centrality = subgraph.x[:, 1].mean()
-                    graph.x[node_id, 1] = (graph.x[node_id, 1] + subgraph_centrality) / 2
+    #                 # Propagate subgraph centrality to parent graph
+    #                 subgraph_centrality = subgraph.x[:, 1].mean()
+    #                 graph.x[node_id, 1] = (graph.x[node_id, 1] + subgraph_centrality) / 2
 
-            return graph
+    #         return graph
 
-        # Start the recursive calculation from the top-level graph
-        updated_graph = recursive_centrality(self.pyg_data)
+    #     # Start the recursive calculation from the top-level graph
+    #     updated_graph = recursive_centrality(self.pyg_data)
         
-        # Update the Graph object with new centrality values
-        for node_id, centrality in enumerate(updated_graph.x[:, 1]):
-            self.nodes[node_id].eigenvector_centrality = centrality.item()
+    #     # Update the Graph object with new centrality values
+    #     for node_id, centrality in enumerate(updated_graph.x[:, 1]):
+    #         self.nodes[node_id].eigenvector_centrality = centrality.item()
 
-    def calculate_eigenvector_centrality(self):
-        nx_graph = self.to_networkx()
-        num_nodes = nx_graph.number_of_nodes()
+    # def calculate_eigenvector_centrality(self):
+    #     nx_graph = self.to_networkx()
+    #     num_nodes = nx_graph.number_of_nodes()
         
-        if num_nodes < 3:
-            # For very small graphs, assign equal centrality to all nodes
-            centrality = {node: 1.0 / num_nodes for node in nx_graph.nodes()}
-        else:
-            try:
-                # Try using eigenvector_centrality_numpy
-                centrality = nx.eigenvector_centrality_numpy(nx_graph)
-            except (TypeError, np.linalg.LinAlgError):
-                # If that fails, fall back to power iteration method
-                try:
-                    centrality = nx.eigenvector_centrality(nx_graph, max_iter=1000)
-                except nx.PowerIterationFailedConvergence:
-                    # If power iteration fails, use degree centrality as an approximation
-                    centrality = nx.degree_centrality(nx_graph)
+    #     if num_nodes < 3:
+    #         # For very small graphs, assign equal centrality to all nodes
+    #         centrality = {node: 1.0 / num_nodes for node in nx_graph.nodes()}
+    #     else:
+    #         try:
+    #             # Try using eigenvector_centrality_numpy
+    #             centrality = nx.eigenvector_centrality_numpy(nx_graph)
+    #         except (TypeError, np.linalg.LinAlgError):
+    #             # If that fails, fall back to power iteration method
+    #             try:
+    #                 centrality = nx.eigenvector_centrality(nx_graph, max_iter=1000)
+    #             except nx.PowerIterationFailedConvergence:
+    #                 # If power iteration fails, use degree centrality as an approximation
+    #                 centrality = nx.degree_centrality(nx_graph)
         
-        for node_id, centrality_value in centrality.items():
-            self.nodes[node_id].eigenvector_centrality = centrality_value
-        self._update_pyg_data()
+    #     for node_id, centrality_value in centrality.items():
+    #         self.nodes[node_id].eigenvector_centrality = centrality_value
+    #     self._update_pyg_data()
 
     def set_node_subgraph(self, node_id: int, subgraph: 'Graph'|Dict):
         if node_id in self.nodes:
@@ -210,8 +247,20 @@ class Graph(BaseModel):
             if isinstance(subgraph, Dict):
                 subgraph = Graph(user_id=self.user_id).from_dict(subgraph)
 
+            subgraph.parent = self
+            subgraph.depth = self.depth + 1
             self.nodes[node_id].set_subgraph(subgraph)
             self._update_pyg_data()
+
+    def get_root_graph(self) -> 'Graph':
+        return self.parent.get_root_graph() if self.parent else self
+    
+    def get_all_cross_hierarchy_edges(self) -> List[CrossHierarchyEdge]:
+        edges = list(self.cross_hierarchy_edges.values())
+        for node in self.nodes.values():
+            if node.subgraph:
+                edges.extend(node.subgraph.get_all_cross_hierarchy_edges())
+        return edges
 
     def _update_pyg_data(self):
         node_features = [node.to_feature_vector() for node in self.nodes.values()]
@@ -227,6 +276,39 @@ class Graph(BaseModel):
             edge_attr=torch.tensor(edge_attr, dtype=torch.float),
             subgraphs=subgraphs
         )
+
+    def calculate_eigenvector_centrality(self):
+        # Create a flat representation of the entire graph hierarchy
+        flat_graph = nx.DiGraph()
+        self._add_to_flat_graph(flat_graph)
+
+        # Add cross-hierarchy edges to the flat graph
+        for edge in self.get_all_cross_hierarchy_edges():
+            from_node = self.get_root_graph().resolve_global_node_id(edge.from_node_global)
+            to_node = self.get_root_graph().resolve_global_node_id(edge.to_node_global)
+            if from_node and to_node:
+                flat_graph.add_edge(id(from_node), id(to_node))
+
+        # Calculate centrality on the flat graph
+        centrality = nx.eigenvector_centrality(flat_graph)
+
+        # Update centrality values in the original hierarchical structure
+        self._update_centrality_from_flat(centrality)
+
+    def _add_to_flat_graph(self, flat_graph: nx.DiGraph):
+        for node in self.nodes.values():
+            flat_graph.add_node(id(node))
+        for (from_node, to_node), edge in self.edges.items():
+            flat_graph.add_edge(id(self.nodes[from_node]), id(self.nodes[to_node]))
+        for node in self.nodes.values():
+            if node.subgraph:
+                node.subgraph._add_to_flat_graph(flat_graph)
+
+    def _update_centrality_from_flat(self, centrality: Dict[int, float]):
+        for node in self.nodes.values():
+            node.eigenvector_centrality = centrality[id(node)]
+            if node.subgraph:
+                node.subgraph._update_centrality_from_flat(centrality)
 
     def to_networkx(self):
         G = nx.DiGraph()
