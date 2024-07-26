@@ -39,7 +39,7 @@ class GlobalNodeID(BaseModel):
 
     @classmethod
     def from_string(cls, s: str):
-        return cls([int(x) if x.isdigit() else x for x in s.split(".")])
+        return cls(path=[int(x) if x.isdigit() else x for x in s.split(".")])
 
 
 class Node(BaseModel):
@@ -93,10 +93,21 @@ class Edge(BaseModel):
     
 
 class CrossHierarchyEdge(Edge):
+    from_node: GlobalNodeID
+    to_node: GlobalNodeID
+
     def __init__(self, from_node: GlobalNodeID, to_node: GlobalNodeID, **kwargs):
-        super().__init__(from_node=str(from_node), to_node=str(to_node), **kwargs)
-        self.from_node_global = from_node
-        self.to_node_global = to_node
+        super().__init__(from_node=from_node, to_node=to_node, **kwargs)  # Use dummy values
+        self.from_node = from_node
+        self.to_node = to_node
+
+    @property
+    def from_node(self) -> str:
+        return str(self.from_node_global)
+
+    @property
+    def to_node(self) -> str:
+        return str(self.to_node_global)
 
 
 class Graph(BaseModel):
@@ -260,6 +271,7 @@ class Graph(BaseModel):
         for node in self.nodes.values():
             if node.subgraph:
                 edges.extend(node.subgraph.get_all_cross_hierarchy_edges())
+        print(f"Printing Cross Hierarchy Edges: {edges}")
         return edges
 
     def _update_pyg_data(self):
@@ -284,15 +296,16 @@ class Graph(BaseModel):
 
         # Add cross-hierarchy edges to the flat graph
         for edge in self.get_all_cross_hierarchy_edges():
-            from_node = self.get_root_graph().resolve_global_node_id(edge.from_node_global)
-            to_node = self.get_root_graph().resolve_global_node_id(edge.to_node_global)
+            from_node = self.get_root_graph().resolve_global_node_id(edge.from_node)
+            to_node = self.get_root_graph().resolve_global_node_id(edge.to_node)
             if from_node and to_node:
                 flat_graph.add_edge(id(from_node), id(to_node))
 
-        # Calculate centrality on the flat graph
-        centrality = nx.eigenvector_centrality(flat_graph)
-
-        # Update centrality values in the original hierarchical structure
+        try:
+            centrality = nx.eigenvector_centrality(flat_graph)
+        except nx.PowerIterationFailedConvergence:
+            # Fallback to degree centrality if eigenvector centrality fails
+            centrality = nx.degree_centrality(flat_graph)
         self._update_centrality_from_flat(centrality)
 
     def _add_to_flat_graph(self, flat_graph: nx.DiGraph):
@@ -313,14 +326,14 @@ class Graph(BaseModel):
     def to_networkx(self):
         G = nx.DiGraph()
         for node_id, node in self.nodes.items():
-            G.add_node(node_id, **node.dict())
+            G.add_node(node_id, **node.model_dump())
         for (from_node, to_node), edge in self.edges.items():
-            G.add_edge(from_node, to_node, **edge.dict())
+            G.add_edge(from_node, to_node, **edge.model_dump())
         return G
 
     @classmethod
-    def from_networkx(cls, nx_graph):
-        graph = cls()
+    def from_networkx(cls, nx_graph, user_id="default_user"):
+        graph = cls(user_id=user_id)
         for node, data in nx_graph.nodes(data=True):
             graph.add_node(node, data['name'])
             for key, value in data.items():
@@ -561,58 +574,3 @@ class GraphRandomizer(BaseModel):
         for node in graph.nodes.values():
             if node.subgraph:
                 self.simulate_usage_recursive(graph=node.subgraph, days=days, max_daily_interactions=max_daily_interactions)
-
-
-class GraphPresenter(BaseModel):
-    def display_simulation_results(self, graph: Graph, indent: int = 0, max_depth: Optional[int] = None):
-        self._display_graph(graph=graph, indent=indent, max_depth=max_depth)
-        self._display_summary_statistics(graph=graph, indent=indent)
-
-
-    def _display_graph(self, graph: Graph, indent: int = 0, max_depth: Optional[int] = None):
-        prefix = "  " * indent
-        print(f"{prefix}Graph ID: {graph.id}")
-        print(f"{prefix}Number of nodes: {len(graph.nodes)}")
-        print(f"{prefix}Number of edges: {len(graph.edges)}")
-        print(f"{prefix}Nodes:")
-        
-        for node_id, node in graph.nodes.items():
-            print(f"{prefix}  Node {node_id}: {node.name}")
-            print(f"{prefix}    Interest Frequency: {node.interest_frequency}")
-            print(f"{prefix}    Eigenvector Centrality: {node.eigenvector_centrality:.4f}")
-            print(f"{prefix}    Last Engagement: {node.last_engagement}")
-            print(f"{prefix}    Engagement Score: {node.engagement_score:.4f}")
-            
-            if node.subgraph and (max_depth is None or indent < max_depth):
-                print(f"{prefix}    Subgraph:")
-                self._display_graph(graph=node.subgraph, indent=indent + 3, max_depth=max_depth)
-        
-        print(f"{prefix}Edges:")
-        for (from_node, to_node), edge in graph.edges.items():
-            print(f"{prefix}  Edge {from_node} -> {to_node}:")
-            print(f"{prefix}    Interaction Strength: {edge.interaction_strength}")
-            print(f"{prefix}    Last Interaction: {edge.last_interaction}")
-            print(f"{prefix}    Contextual Similarity: {edge.contextual_similarity:.4f}")
-            print(f"{prefix}    Sequential Relation: {edge.sequential_relation:.4f}")
-        
-        print()  # Add a blank line for readability
-
-
-    def _display_summary_statistics(self, graph: Graph, indent: int = 0):
-        prefix = "  " * indent
-        print(f"{prefix}Summary Statistics:")
-        
-        # Calculate average engagement score
-        avg_engagement = sum(node.engagement_score for node in graph.nodes.values()) / len(graph.nodes)
-        print(f"{prefix}  Average Engagement Score: {avg_engagement:.4f}")
-        
-        # Find most active node
-        most_active_node = max(graph.nodes.values(), key=lambda n: n.interest_frequency)
-        print(f"{prefix}  Most Active Node: {most_active_node.name} (ID: {most_active_node.id})")
-        
-        # Calculate average edge interaction strength
-        if graph.edges:
-            avg_interaction = sum(edge.interaction_strength for edge in graph.edges.values()) / len(graph.edges)
-            print(f"{prefix}  Average Edge Interaction Strength: {avg_interaction:.2f}")
-        
-        print()  # Add a blank line for readability
