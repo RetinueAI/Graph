@@ -7,6 +7,7 @@ import asyncio
 import pickle
 import hashlib
 
+from motor.motor_asyncio import AsyncIOMotorCollection
 from cryptography.fernet import Fernet
 
 from geo_graph import Graph, GraphSync, Edges, Edge
@@ -81,6 +82,7 @@ def generate_random_changes(graph: Graph):
             })
     return changes
 
+
 def verify_changes(graph, changes):
     print("Verifying changes:")
     for change in changes:
@@ -95,57 +97,24 @@ def verify_changes(graph, changes):
             for key, value in change["edge_data"].items():
                 print(f"  {key}: {getattr(edge, key)}")
 
-def print_graph_stats(graph):
-    print(f"\nTotal nodes: {len(graph.nodes)}")
-    print(f"Total edges: {len(graph.edges)}")
+
+def print_graph_stats(graph: Graph):
+    print(f"\nTotal nodes: {len(graph.node_map.nodes)}")
+    print(f"Total edges: {len(graph.edges.edges)}")
     
-async def list_all_entries(collection):
+
+async def list_all_entries(collection: AsyncIOMotorCollection):
     cursor = collection.find({})
     documents = []
     async for document in cursor:
         documents.append(document)
     return documents
 
-async def delete_many(collection):
+
+async def delete_many(collection: AsyncIOMotorCollection):
     result = await collection.delete_many({})
     print(f"Deleted {result.deleted_count} documents")
 
-def serialize_graph(graph) -> bytes:
-    return pickle.dumps(graph, protocol=pickle.HIGHEST_PROTOCOL)
-
-def save_graph_to_file(serialized_graph, file_path) -> None:
-    with open(file_path, 'wb') as file:
-        file.write(serialized_graph)
-
-def load_graph_from_file(file_path) -> Graph:
-    with open(file_path, 'rb') as file:
-        serialized_graph = file.read()
-    return pickle.loads(serialized_graph)
-
-def calculate_checksum(file_path):
-    hash_md5 = hashlib.md5()
-    with open(file_path, "rb") as f:
-        for chunk in iter(lambda: f.read(4096), b""):
-            hash_md5.update(chunk)
-    return hash_md5.hexdigest()
-
-def save_checksum(checksum, checksum_file_path):
-    with open(checksum_file_path, 'w') as file:
-        file.write(checksum)
-
-def load_graph_from_file(file_path):
-    with open(file_path, 'rb') as file:
-        serialized_graph = file.read()
-    return pickle.loads(serialized_graph)
-
-def verify_checksum(file_path, checksum_file_path):
-    with open(checksum_file_path, 'r') as file:
-        saved_checksum = file.read().strip()
-    calculated_checksum = calculate_checksum(file_path)
-    return saved_checksum == calculated_checksum
-
-def generate_key() -> bytes:
-    return Fernet.generate_key()
 
 async def main():
     # Initialize graph and generate data
@@ -172,13 +141,6 @@ async def main():
     print(f"Edge generation took: {edge_time}s")
 
     print(f"\nTotal creation time: {graph_time + edge_time}s")
-
-    # # Serialize the graph
-    # serialized_graph = serialize_graph(graph)
-    
-    # # Save the serialized graph to a file
-    # file_path = 'graph.pkl'
-    # save_graph_to_file(serialized_graph, file_path)
     
     # print('Graph Saved')
 

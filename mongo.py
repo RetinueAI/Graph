@@ -7,7 +7,6 @@ from pydantic import BaseModel, model_validator
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.server_api import ServerApi
 from pymongo.results import InsertOneResult, InsertManyResult, DeleteResult, UpdateResult
-from bson import ObjectId
 
 
 

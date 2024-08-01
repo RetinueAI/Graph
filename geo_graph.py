@@ -83,17 +83,20 @@ class NodeMap(BaseModel):
     
 
 class Edges(BaseModel):
-    edges: Dict[Tuple[Tuple[int], Tuple[int]], Edge] = Field(default_factory=dict)
+    edges: Dict[Tuple[Tuple[int, ...], Tuple[int, ...]], Edge] = Field(default_factory=dict)
 
 
-    def get_edge(self, _from: Tuple[int], _to: Tuple[int]) -> Edge:
+    def get_edge(self, _from: Tuple[int, ...], _to: Tuple[int, ...]) -> Edge:
         return self.edges[(_from, _to)]
 
 
-    def convert_list(self, str_list: List[str], graph: 'Graph') -> Tuple[int]:
+    def convert_str_list(self, str_list: List[str], graph: 'Graph') -> Tuple[int]:
+        if len(str_list) < 1:
+            return []
+        
         int_list = []
 
-        int_list.append(graph.node_map.node_map.get(str_list[0]))
+        int_list.append(graph.node_map.node_map[str_list[0]])
 
         if int_list[0] is None:
             raise ValueError(f"Node {str_list[0]} doesn't exist in graph {graph.id}.")
@@ -105,14 +108,14 @@ class Edges(BaseModel):
                 raise ValueError(f"The subgraph in node {int_list[0]} doesn't exist in graph {graph.id}")
             
             int_list.extend(
-                self.convert_list(str_list[1:], subgraph)
+                self.convert_str_list(str_list[1:], subgraph)
             )
 
         return tuple(int_list)
 
 
     def generate_edge_key(self, from_: List[str], to_: List[str], root_graph: 'Graph') -> Tuple[Tuple[int],Tuple[int]]:
-        return (self.convert_list(from_, root_graph), self.convert_list(to_, root_graph))
+        return (self.convert_str_list(from_, root_graph), self.convert_str_list(to_, root_graph))
 
 
     def add_edge_from_str(self, from_: List[str], to_: List[str], root_graph: 'Graph') -> None:
@@ -149,13 +152,13 @@ class Graph(BaseModel):
         self.node_map.node_map[name] = id
         return node
 
-    def get_edge(self, _from: Tuple[int], _to: Tuple[int]) -> Edge:
+    def get_edge(self, _from: Tuple[int, ...], _to: Tuple[int, ...]) -> Edge:
         return self.edges.get_edge((_from, _to))
 
     def get_node(self, node_id: int) -> Node:
         return self.node_map.get_node(node_id)
 
-    def remove_edge(self, _from: List[int], _to: List[int]):
+    def remove_edge(self, _from: Tuple[int, ...], _to: Tuple[int, ...]):
         self.edges.edges.pop((_from, _to), None)
 
     def remove_node(self, node_id: int):
@@ -166,7 +169,7 @@ class Graph(BaseModel):
         if node_id in self.node_map.nodes:
             self.node_map.nodes[node_id].update_engagement()
 
-    def update_edge_interaction(self, _from: Tuple[int], _to: Tuple[int]):
+    def update_edge_interaction(self, _from: Tuple[int, ...], _to: Tuple[int, ...]):
         edge_key = (_from, _to)
         if edge_key in self.edges:
             self.edges.edges[edge_key].update_interaction()
@@ -365,6 +368,8 @@ class GraphSync(BaseModel):
             raise
 
     async def reconstruct_graph(self, graph: Graph, graphs: Dict[str, Graph], graph_map: Dict[str, str]):
+        # TODO Make sense of what's going on here.
+        # TODO Needs to work with the new Edge implementation.
         for node in graph_map.keys():
             try:
                 graph_id = list(graph_map[node].keys())[0] 
