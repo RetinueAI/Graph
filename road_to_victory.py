@@ -1,7 +1,7 @@
 import json
 import time
 import os
-from typing import Type
+from typing import Type, List
 import random
 import asyncio
 import pickle
@@ -9,54 +9,48 @@ import hashlib
 
 from cryptography.fernet import Fernet
 
-from geo_graph import Graph, GraphSync
+from geo_graph import Graph, GraphSync, Edges, Edge
 from mongo import MongoHandler
 
 
 
-def generate_graph(graph: Graph, categories):
+def generate_graph(graph: Graph, categories: dict[str,dict]):
 
-    for i, parent in enumerate(categories.keys()):
-        graph.add_node(i, parent)
+    for id, parent in enumerate(categories.keys()):
+        graph.add_node(id, parent)
 
         if len(categories[parent]) > 0:
-            graph.set_node_subgraph(i, subgraph=Graph())
-            generate_graph(graph=graph.nodes[i].subgraph, categories=categories[parent])
-
-    for j in range(len(graph.nodes)):
-        for k in range(len(graph.nodes)):
-            if j != k:
-                graph.add_edge(j, k)
-                graph.add_edge(k, j)
+            graph.set_node_subgraph(id, subgraph=Graph(user_id=graph.user_id, edges=graph.edges))
+            generate_graph(graph=graph.node_map.nodes[id].subgraph, categories=categories[parent])
 
 
-# graph = Graph()
+def extract_edge_endpoints(categories: dict[str,dict]) -> List[str]:
+    endpoints = []
 
-# generate_graph(graph=graph, categories=categories_json)
+    for key in categories.keys():
+        if len(categories[key]) > 0:
+            sub_endpoints = extract_edge_endpoints(categories=categories[key])
 
-# filename = 'victory'
-# graph.save_graph(filename=filename)
+            for sub in sub_endpoints:
+                nested_key = [key]
+                nested_key.extend(sub)
+                endpoints.append(nested_key)
+        else:
+            endpoints.append([key])
 
-# file_size = os.path.getsize(f'{filename}.json')
+    return endpoints
 
-# print(f"The size of the saved graph is {file_size} bytes")
-# print(f"The size of the saved graph is {file_size / 1024:.2f} KB")
-# print(f"The size of the saved graph is {file_size / (1024 * 1024):.2f} MB")
 
-# uri = "mongodb+srv://mimir.kjfum9z.mongodb.net/?authSource=%24external&authMechanism=MONGODB-X509&appName=Mimir"
-# mongo_handler = MongoHandler(
-#     uri=uri,
-#     cert_path='./mongocert.pem',
-# )
+def generate_edges(root_graph: Graph, categories: dict[str,dict]) -> None:
+    edge_endpoints = extract_edge_endpoints(categories=categories)
 
-# local_storage_path = os.path.join(os.getcwd(), 'graph_sync_timestamp.json')
-# graph_sync = GraphSync(
-#     local_graph=graph,
-#     db_client=mongo_handler.client,
-#     local_storage_path=local_storage_path
-# )
+    for i in range(len(edge_endpoints)):
+        for j in range(len(edge_endpoints)):
+            if i != j:
+                root_graph.edges.add_edge_from_str(from_=edge_endpoints[i], to_=edge_endpoints[j], root_graph=root_graph)
 
-def generate_random_changes(graph):
+
+def generate_random_changes(graph: Graph):
     changes = []
     for _ in range(random.randint(1, 5)):  # Generate 1 to 5 changes
         change_type = random.choice(["update_node", "update_edge"])
@@ -73,7 +67,7 @@ def generate_random_changes(graph):
                 }
             })
         else:  # update_edge
-            edge = random.choice(list(graph.edges.keys()))
+            edge = random.choice(list(graph.edges.edges.keys()))
             changes.append({
                 "type": "update_edge",
                 "from_node": edge[0],
@@ -155,13 +149,29 @@ def generate_key() -> bytes:
 
 async def main():
     # Initialize graph and generate data
-    graph = Graph()
+    with open('user_id.txt', 'r') as f:
+        user_id = f.read()
+
+    graph = Graph(user_id=user_id)
 
     with open('categories.json', 'r') as f:
         categories = json.load(f)
 
+    before_graph = time.time()
     generate_graph(graph=graph, categories=categories)
+    after_graph = time.time()
+    graph_time = after_graph - before_graph
     print('Graph generated')
+    print(f"Graph generation took: {graph_time}s")
+
+    before_edges = time.time()
+    generate_edges(root_graph=graph, categories=categories)
+    after_edges = time.time()
+    edge_time = after_edges - before_edges
+    print(f"Total amount of edges: {len(graph.edges.edges)}")
+    print(f"Edge generation took: {edge_time}s")
+
+    print(f"\nTotal creation time: {graph_time + edge_time}s")
 
     # # Serialize the graph
     # serialized_graph = serialize_graph(graph)
@@ -196,24 +206,24 @@ async def main():
     # print(f"The size of the saved graph is {file_size / (1024 * 1024):.2f} MB")
 
     # Initialize MongoHandler and GraphSync
-    uri = "mongodb+srv://mimir.kjfum9z.mongodb.net/?authSource=%24external&authMechanism=MONGODB-X509&appName=Mimir"
-    mongo_handler = MongoHandler(
-        uri=uri,
-        cert_path='./mongocert.pem',
-    )
+    # uri = "mongodb+srv://mimir.kjfum9z.mongodb.net/?authSource=%24external&authMechanism=MONGODB-X509&appName=Mimir"
+    # mongo_handler = MongoHandler(
+    #     uri=uri,
+    #     cert_path='./mongocert.pem',
+    # )
 
-    graph_sync = GraphSync(
-        graph=graph,
-        mongo_handler=mongo_handler,
-        local_storage_path=os.path.join(os.getcwd(), 'graph_sync_timestamp.json')
-    )
+    # graph_sync = GraphSync(
+    #     graph=graph,
+    #     mongo_handler=mongo_handler,
+    #     local_storage_path=os.path.join(os.getcwd(), 'graph_sync_timestamp.json')
+    # )
 
-    # Test database connection
-    if await mongo_handler.test_database_connection():
-        print("Successfully connected to the database.")
-    else:
-        print("Failed to connect to the database. Please check your connection settings.")
-        return
+    # # Test database connection
+    # if await mongo_handler.test_database_connection():
+    #     print("Successfully connected to the database.")
+    # else:
+    #     print("Failed to connect to the database. Please check your connection settings.")
+    #     return
     
     # await graph_sync.save_to_database()
 
@@ -226,22 +236,22 @@ async def main():
     # for col in col_list:
     #     print(col['_id'])
 
-    if await graph_sync.save_to_database():
-        print(f"Graph saved to datanase with ID: {graph.id}")
+    # if await graph_sync.save_to_database():
+    #     print(f"Graph saved to datanase with ID: {graph.id}")
 
-    try:
-        loaded_graph = await graph_sync.load_from_database(graph.id)
-        print(f"Loaded graph with ID: {loaded_graph.id}")
+    # try:
+    #     loaded_graph = await graph_sync.load_from_database(graph.id)
+    #     print(f"Loaded graph with ID: {loaded_graph.id}")
 
-        print(type(graph))
-        print(type(loaded_graph))
+    #     print(type(graph))
+    #     print(type(loaded_graph))
 
-        print(len(graph.nodes[1].subgraph.nodes[2].subgraph.nodes))
-        print(len(loaded_graph.nodes[1].subgraph.nodes[2].subgraph.nodes))
-    except Exception as e:
-        print(f"Error loading graph from database: {e}")
+    #     print(len(graph.nodes[1].subgraph.nodes[2].subgraph.nodes))
+    #     print(len(loaded_graph.nodes[1].subgraph.nodes[2].subgraph.nodes))
+    # except Exception as e:
+    #     print(f"Error loading graph from database: {e}")
 
-    mongo_handler.client.close()
+    # mongo_handler.client.close()
     
     # yes = await graph_sync.save_to_database()
 

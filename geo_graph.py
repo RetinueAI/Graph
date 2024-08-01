@@ -18,30 +18,6 @@ from mongo import MongoHandler
     
 
 
-class RecursiveData(Data):
-    def __init__(self, x=None, edge_index=None, edge_attr=None, subgraphs=None, **kwargs):
-        super().__init__(x=x, edge_index=edge_index, edge_attr=edge_attr, **kwargs)
-        self.subgraphs = subgraphs if subgraphs is not None else {}
-
-    def __inc__(self, key, value, *args, **kwargs):
-        if key == 'edge_index':
-            return self.x.size(0)
-        if key == 'subgraphs':
-            return {k: 0 for k in self.subgraphs.keys()}
-        return super().__inc__(key, value, *args, **kwargs)
-
-
-class GlobalNodeID(BaseModel):
-    path: List[Union[str, int]]
-
-    def __str__(self):
-        return ".".join(map(str, self.path))
-
-    @classmethod
-    def from_string(cls, s: str):
-        return cls(path=[int(x) if x.isdigit() else x for x in s.split(".")])
-
-
 class Node(BaseModel):
     id: int
     name: str
@@ -72,8 +48,8 @@ class Node(BaseModel):
         ]
 
 class Edge(BaseModel):
-    from_node: int
-    to_node: int
+    from_node: List[int]
+    to_node: List[int]
     interaction_strength: int = Field(default=0)
     last_interaction: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     contextual_similarity: float = Field(default=0.0)
@@ -90,34 +66,77 @@ class Edge(BaseModel):
             self.sequential_relation,
             (datetime.now(timezone.utc) - self.last_interaction).total_seconds()
         ]
+
+
+class NodeMap(BaseModel):
+    nodes: Dict[int, Node] = Field(default_factory=dict)
+    node_map: Dict[str, int] = Field(default_factory=dict)
+
+    def get_node(self, node: int) -> Node:
+        return self.nodes[node]
+
+    def get_node_id(self, node: str):
+        return self.node_map[node]
+    
+    class Config:
+        arbitrary_types_allowed = True
     
 
-class CrossHierarchyEdge(Edge):
-    from_node: GlobalNodeID
-    to_node: GlobalNodeID
+class Edges(BaseModel):
+    edges: Dict[Tuple[Tuple[int], Tuple[int]], Edge] = Field(default_factory=dict)
 
-    def __init__(self, from_node: GlobalNodeID, to_node: GlobalNodeID, **kwargs):
-        super().__init__(from_node=from_node, to_node=to_node, **kwargs)  # Use dummy values
-        self.from_node = from_node
-        self.to_node = to_node
 
-    @property
-    def from_node(self) -> str:
-        return str(self.from_node_global)
+    def get_edge(self, _from: Tuple[int], _to: Tuple[int]) -> Edge:
+        return self.edges[(_from, _to)]
 
-    @property
-    def to_node(self) -> str:
-        return str(self.to_node_global)
+
+    def convert_list(self, str_list: List[str], graph: 'Graph') -> Tuple[int]:
+        int_list = []
+
+        int_list.append(graph.node_map.node_map.get(str_list[0]))
+
+        if int_list[0] is None:
+            raise ValueError(f"Node {str_list[0]} doesn't exist in graph {graph.id}.")
+
+        if len(str_list) > 1:
+            subgraph = graph.node_map.nodes[int_list[0]].subgraph
+
+            if subgraph is None:
+                raise ValueError(f"The subgraph in node {int_list[0]} doesn't exist in graph {graph.id}")
+            
+            int_list.extend(
+                self.convert_list(str_list[1:], subgraph)
+            )
+
+        return tuple(int_list)
+
+
+    def generate_edge_key(self, from_: List[str], to_: List[str], root_graph: 'Graph') -> Tuple[Tuple[int],Tuple[int]]:
+        return (self.convert_list(from_, root_graph), self.convert_list(to_, root_graph))
+
+
+    def add_edge_from_str(self, from_: List[str], to_: List[str], root_graph: 'Graph') -> None:
+        edge_key = self.generate_edge_key(from_, to_, root_graph)
+
+        
+        if edge_key in self.edges:
+            raise ValueError("Edge already exists")
+
+        edge = Edge(from_node=edge_key[0], to_node=edge_key[1])
+        self.edges[edge_key] = edge
+
+
+    class Config:
+        arbitrary_types_allowed = True
 
 
 class Graph(BaseModel):
     version: int = 1
+    root: bool = Field(default=False)
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     user_id: str
-    nodes: Dict[int, Node] = Field(default_factory=dict)
-    edges: Dict[Tuple[int, int], Edge] = Field(default_factory=dict)
-    pyg_data: Optional[RecursiveData] = None
-    cross_hierarchy_edges: Dict[Tuple[str, str], CrossHierarchyEdge] = Field(default_factory=dict)
+    node_map: NodeMap = Field(default_factory=NodeMap)
+    edges: Edges = Field(default_factory=Edges)
     parent: Optional['Graph'] = None
     depth: int = 0
 
@@ -126,225 +145,42 @@ class Graph(BaseModel):
 
     def add_node(self, id: int, name: str) -> Node:
         node = Node(id=id, name=name)
-        self.nodes[id] = node
-        self._update_pyg_data()
+        self.node_map.nodes[id] = node
+        self.node_map.node_map[name] = id
         return node
 
-    def add_edge(self, from_node: int, to_node: int) -> Edge:
-        if from_node not in self.nodes or to_node not in self.nodes:
-            raise ValueError("Both nodes must exist in the graph")
-        edge_key = (from_node, to_node)
-        if edge_key not in self.edges:
-            edge = Edge(from_node=from_node, to_node=to_node)
-            self.edges[edge_key] = edge
-            self._update_pyg_data()
-        return self.edges[edge_key]
-
-    def get_edge(self, from_node: int, to_node: int) -> Edge:
-        return self.edges.get((from_node, to_node))
+    def get_edge(self, _from: Tuple[int], _to: Tuple[int]) -> Edge:
+        return self.edges.get_edge((_from, _to))
 
     def get_node(self, node_id: int) -> Node:
-        return self.nodes.get(node_id)
+        return self.node_map.get_node(node_id)
 
-    def remove_edge(self, from_node: int, to_node: int):
-        self.edges.pop((from_node, to_node), None)
-        self._update_pyg_data()
+    def remove_edge(self, _from: List[int], _to: List[int]):
+        self.edges.edges.pop((_from, _to), None)
 
     def remove_node(self, node_id: int):
-        self.nodes.pop(node_id, None)
-        self.edges = {k: v for k, v in self.edges.items() if node_id not in k}
-        self._update_pyg_data()
+        self.node_map.nodes.pop(node_id, None)
+        self.edges = {k: v for k, v in self.edges.edges.items() if node_id not in k}
 
     def update_node_engagement(self, node_id: int):
-        if node_id in self.nodes:
-            self.nodes[node_id].update_engagement()
-            self._update_pyg_data()
+        if node_id in self.node_map.nodes:
+            self.node_map.nodes[node_id].update_engagement()
 
-    def update_edge_interaction(self, from_node: int, to_node: int):
-        edge_key = (from_node, to_node)
+    def update_edge_interaction(self, _from: Tuple[int], _to: Tuple[int]):
+        edge_key = (_from, _to)
         if edge_key in self.edges:
-            self.edges[edge_key].update_interaction()
-            self._update_pyg_data()
+            self.edges.edges[edge_key].update_interaction()
 
-    def add_cross_hierarchy_edge(self, from_node: GlobalNodeID, to_node: GlobalNodeID) -> CrossHierarchyEdge:
-        edge = CrossHierarchyEdge(from_node=from_node, to_node=to_node)
-        self.cross_hierarchy_edges[(str(from_node), str(to_node))] = edge
-        return edge
-    
-    def resolve_global_node_id(self, global_id: GlobalNodeID) -> Optional[Node]:
-        if len(global_id.path) == 1:
-            return self.nodes.get(global_id.path[0])
-        
-        next_subgraph = self.nodes.get(global_id.path[0])
-        if next_subgraph and next_subgraph.subgraph:
-            return next_subgraph.subgraph.resolve_global_node_id(GlobalNodeID(global_id.path[1:]))
-        
-        return None
-
-    # def calculate_eigenvector_centrality_pyg(self, max_iterations=100, tolerance=1e-6):
-    #     def calculate_for_graph(graph):
-    #         # Convert edge_index to dense adjacency matrix
-    #         adj_matrix = to_dense_adj(graph.edge_index)[0]
-            
-    #         # Initialize centrality vector
-    #         centrality = torch.ones(graph.num_nodes, device=graph.x.device)
-            
-    #         for _ in range(max_iterations):
-    #             prev_centrality = centrality.clone()
-                
-    #             # Compute new centrality
-    #             centrality = torch.matmul(adj_matrix, centrality)
-                
-    #             # Normalize
-    #             centrality = centrality / centrality.norm(p=2)
-                
-    #             # Check for convergence
-    #             if torch.allclose(centrality, prev_centrality, rtol=tolerance):
-    #                 break
-            
-    #         return centrality
-
-    #     def recursive_centrality(graph):
-    #         # Calculate centrality for current graph
-    #         centrality = calculate_for_graph(graph)
-            
-    #         # Update node features with centrality
-    #         graph.x[:, 1] = centrality  # Assuming eigenvector_centrality is the second feature
-
-    #         # Recursively calculate for subgraphs
-    #         for node_id, subgraph in graph.subgraphs.items():
-    #             if subgraph is not None:
-    #                 recursive_centrality(subgraph)
-                    
-    #                 # Propagate subgraph centrality to parent graph
-    #                 subgraph_centrality = subgraph.x[:, 1].mean()
-    #                 graph.x[node_id, 1] = (graph.x[node_id, 1] + subgraph_centrality) / 2
-
-    #         return graph
-
-    #     # Start the recursive calculation from the top-level graph
-    #     updated_graph = recursive_centrality(self.pyg_data)
-        
-    #     # Update the Graph object with new centrality values
-    #     for node_id, centrality in enumerate(updated_graph.x[:, 1]):
-    #         self.nodes[node_id].eigenvector_centrality = centrality.item()
-
-    # def calculate_eigenvector_centrality(self):
-    #     nx_graph = self.to_networkx()
-    #     num_nodes = nx_graph.number_of_nodes()
-        
-    #     if num_nodes < 3:
-    #         # For very small graphs, assign equal centrality to all nodes
-    #         centrality = {node: 1.0 / num_nodes for node in nx_graph.nodes()}
-    #     else:
-    #         try:
-    #             # Try using eigenvector_centrality_numpy
-    #             centrality = nx.eigenvector_centrality_numpy(nx_graph)
-    #         except (TypeError, np.linalg.LinAlgError):
-    #             # If that fails, fall back to power iteration method
-    #             try:
-    #                 centrality = nx.eigenvector_centrality(nx_graph, max_iter=1000)
-    #             except nx.PowerIterationFailedConvergence:
-    #                 # If power iteration fails, use degree centrality as an approximation
-    #                 centrality = nx.degree_centrality(nx_graph)
-        
-    #     for node_id, centrality_value in centrality.items():
-    #         self.nodes[node_id].eigenvector_centrality = centrality_value
-    #     self._update_pyg_data()
 
     def set_node_subgraph(self, node_id: int, subgraph: 'Graph'|Dict):
-        if node_id in self.nodes:
+        if node_id in self.node_map.nodes:
 
             if isinstance(subgraph, Dict):
                 subgraph = Graph(user_id=self.user_id).from_dict(subgraph)
 
             subgraph.parent = self
             subgraph.depth = self.depth + 1
-            self.nodes[node_id].set_subgraph(subgraph)
-            self._update_pyg_data()
-
-    def get_root_graph(self) -> 'Graph':
-        return self.parent.get_root_graph() if self.parent else self
-    
-    def get_all_cross_hierarchy_edges(self) -> List[CrossHierarchyEdge]:
-        edges = list(self.cross_hierarchy_edges.values())
-        for node in self.nodes.values():
-            if node.subgraph:
-                edges.extend(node.subgraph.get_all_cross_hierarchy_edges())
-        print(f"Printing Cross Hierarchy Edges: {edges}")
-        return edges
-
-    def _update_pyg_data(self):
-        node_features = [node.to_feature_vector() for node in self.nodes.values()]
-        edge_index = [[from_node, to_node] for from_node, to_node in self.edges.keys()]
-        edge_attr = [edge.to_feature_vector() for edge in self.edges.values()]
-        subgraphs = {
-            node_id: node.subgraph.pyg_data if node.subgraph else None
-            for node_id, node in self.nodes.items() if node.subgraph
-        }
-        self.pyg_data = RecursiveData(
-            x=torch.tensor(node_features, dtype=torch.float),
-            edge_index=torch.tensor(edge_index, dtype=torch.long).t().contiguous(),
-            edge_attr=torch.tensor(edge_attr, dtype=torch.float),
-            subgraphs=subgraphs
-        )
-
-    def calculate_eigenvector_centrality(self):
-        # Create a flat representation of the entire graph hierarchy
-        flat_graph = nx.DiGraph()
-        self._add_to_flat_graph(flat_graph)
-
-        # Add cross-hierarchy edges to the flat graph
-        for edge in self.get_all_cross_hierarchy_edges():
-            from_node = self.get_root_graph().resolve_global_node_id(edge.from_node)
-            to_node = self.get_root_graph().resolve_global_node_id(edge.to_node)
-            if from_node and to_node:
-                flat_graph.add_edge(id(from_node), id(to_node))
-
-        try:
-            centrality = nx.eigenvector_centrality(flat_graph)
-        except nx.PowerIterationFailedConvergence:
-            # Fallback to degree centrality if eigenvector centrality fails
-            centrality = nx.degree_centrality(flat_graph)
-        self._update_centrality_from_flat(centrality)
-
-    def _add_to_flat_graph(self, flat_graph: nx.DiGraph):
-        for node in self.nodes.values():
-            flat_graph.add_node(id(node))
-        for (from_node, to_node), edge in self.edges.items():
-            flat_graph.add_edge(id(self.nodes[from_node]), id(self.nodes[to_node]))
-        for node in self.nodes.values():
-            if node.subgraph:
-                node.subgraph._add_to_flat_graph(flat_graph)
-
-    def _update_centrality_from_flat(self, centrality: Dict[int, float]):
-        for node in self.nodes.values():
-            node.eigenvector_centrality = centrality[id(node)]
-            if node.subgraph:
-                node.subgraph._update_centrality_from_flat(centrality)
-
-    def to_networkx(self):
-        G = nx.DiGraph()
-        for node_id, node in self.nodes.items():
-            G.add_node(node_id, **node.model_dump())
-        for (from_node, to_node), edge in self.edges.items():
-            G.add_edge(from_node, to_node, **edge.model_dump())
-        return G
-
-    @classmethod
-    def from_networkx(cls, nx_graph, user_id="default_user"):
-        graph = cls(user_id=user_id)
-        for node, data in nx_graph.nodes(data=True):
-            graph.add_node(node, data['name'])
-            for key, value in data.items():
-                if key != 'name':
-                    setattr(graph.nodes[node], key, value)
-        for from_node, to_node, data in nx_graph.edges(data=True):
-            edge = graph.add_edge(from_node, to_node)
-            for key, value in data.items():
-                setattr(edge, key, value)
-        graph._update_pyg_data()
-        return graph
+            self.node_map.nodes[node_id].set_subgraph(subgraph)
     
 
     def to_dict(self):
@@ -357,14 +193,14 @@ class Graph(BaseModel):
                     **{k: (v.isoformat() if isinstance(v, datetime) else v) 
                        for k, v in node.model_dump(exclude={"subgraph"}).items()},
                     "subgraph_id": node.subgraph.id if node.subgraph else None
-                } for node_id, node in self.nodes.items()
+                } for node_id, node in self.node_map.nodes.items()
             },
             "edges": {
                 f"{from_node},{to_node}": {
                     k: (v.isoformat() if isinstance(v, datetime) else v) 
                     for k, v in edge.model_dump().items()
                 } 
-                for (from_node, to_node), edge in self.edges.items()
+                for (from_node, to_node), edge in self.edges.edges.items()
             }
         }
 
@@ -378,7 +214,7 @@ class Graph(BaseModel):
                     for k, v in node_data.items() if k != 'subgraph_id'
                 }
                 node = Node(**parsed_node_data)
-                graph.nodes[int(node_id)] = node
+                graph.node_map.nodes[int(node_id)] = node
             
             for edge_key, edge_data in data['edges'].items():
                 from_node, to_node = map(int, edge_key.split(','))
@@ -389,7 +225,7 @@ class Graph(BaseModel):
                 edge = Edge(**parsed_edge_data)
                 graph.edges[(from_node, to_node)] = edge
             
-            graph._update_pyg_data()
+
         except Exception as e:
             print(f"Error in from_dict: {e}")
             raise
@@ -410,7 +246,6 @@ class GraphSync(BaseModel):
     async def apply_changes(self, changes: List[Dict]):
         for change in changes:
             await self.apply_change_recursive(self.graph, change)
-        self.graph._update_pyg_data()
 
     async def apply_change_recursive(self, graph: Graph, change: Dict[str, Any]):
         if change['type'] == 'add_node':
@@ -423,8 +258,9 @@ class GraphSync(BaseModel):
                 node.set_subgraph(subgraph)
                 for subchange in change['node_data']['subgraph']:
                     await self.apply_change_recursive(subgraph, subchange)
+
         elif change['type'] == 'update_node':
-            node = graph.nodes[change['node_id']]
+            node = graph.node_map.nodes[change['node_id']]
             for key, value in change['node_data'].items():
                 if key != 'subgraph':
                     setattr(node, key, value)
@@ -433,16 +269,17 @@ class GraphSync(BaseModel):
                     node.set_subgraph(Graph())
                 for subchange in change['node_data']['subgraph']:
                     await self.apply_change_recursive(node.subgraph, subchange)
+
         elif change['type'] == 'add_edge':
-            graph.add_edge(change['from_node'], change['to_node'])
+            graph.edges.add_edge_from_str(change['from_node'], change['to_node'])
         elif change['type'] == 'update_edge':
             edge = graph.edges[(change['from_node'], change['to_node'])]
             for key, value in change['edge_data'].items():
                 setattr(edge, key, value)
         elif change['type'] == 'delete_node':
-            graph.nodes.pop(change['node_id'], None)
+            graph.node_map.nodes.pop(change['node_id'], None)
         elif change['type'] == 'delete_edge':
-            graph.edges.pop((change['from_node'], change['to_node']), None)
+            graph.edges.edges.pop((change['from_node'], change['to_node']), None)
 
 
     async def save_graphs_to_database(self, main_graph: Graph) -> InsertManyResult:
@@ -454,15 +291,17 @@ class GraphSync(BaseModel):
             collection_name='Graphs'
         )
 
+
     def collect_graphs(self, graph: Graph) -> List[Dict[str, Any]]:
         graphs = [{'_id': graph.id, 'graph': graph.to_dict()}]
 
-        for node in graph.nodes.values():
+        for node in graph.node_map.nodes.values():
             if node.subgraph:
                 graphs.extend(self.collect_graphs(node.subgraph))
 
         return graphs
     
+
     async def save_map_to_database(self) -> InsertOneResult:
         exists = await self.mongo_handler.document_exists(
             db_name='Graph', 
@@ -534,7 +373,7 @@ class GraphSync(BaseModel):
                 print(e)
                 raise
 
-            await self.reconstruct_graph(graph=graph.nodes[int(node)].subgraph, graphs=graphs, graph_map=graph_map[node][graph_id])
+            await self.reconstruct_graph(graph=graph.node_map.nodes[int(node)].subgraph, graphs=graphs, graph_map=graph_map[node][graph_id])
 
 
 class GraphRandomizer(BaseModel):
@@ -548,13 +387,13 @@ class GraphRandomizer(BaseModel):
             
             for _ in range(daily_interactions):
                 # Randomly select a node to update
-                node = random.choice(list(graph.nodes.values()))
+                node = random.choice(list(graph.node_map.nodes.values()))
                 graph.update_node_engagement(node.id)
                 node.last_engagement = start_date
                 
                 # Randomly update an edge if it exists
-                if graph.edges:
-                    edge = random.choice(list(graph.edges.values()))
+                if graph.edges.edges:
+                    edge = random.choice(list(graph.edges.edges.values()))
                     graph.update_edge_interaction(edge.from_node, edge.to_node)
                     edge.last_interaction = start_date
                     
@@ -562,15 +401,13 @@ class GraphRandomizer(BaseModel):
                     edge.contextual_similarity = min(1.0, edge.contextual_similarity + random.uniform(0, 0.1))
                     edge.sequential_relation = min(1.0, edge.sequential_relation + random.uniform(0, 0.1))
             
-            # Recalculate centrality measures
-            graph.calculate_eigenvector_centrality()
         
         # Update engagement scores for all nodes
-        for node in graph.nodes.values():
+        for node in graph.node_map.nodes.values():
             node.update_engagement_score()
 
     def simulate_usage_recursive(self, graph: Graph, days=30, max_daily_interactions=10):
         self.simulate_usage(graph=graph, days=days, max_daily_interactions=max_daily_interactions)
-        for node in graph.nodes.values():
+        for node in graph.node_map.nodes.values():
             if node.subgraph:
                 self.simulate_usage_recursive(graph=node.subgraph, days=days, max_daily_interactions=max_daily_interactions)
