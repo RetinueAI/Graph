@@ -58,6 +58,10 @@ class MongoHandler(BaseModel):
             self.client.close()
             logging.info("MongoDB connection closed")
 
+    async def count_documents(self, db_name: str, collection_name: str) -> int:
+        collection =  self.get_collection(db_name=db_name, collection_name=collection_name)
+        return await collection.count_documents()
+
     async def insert(self, entry: dict, db_name: str = 'data', collection_name: str = 'url_map') -> InsertOneResult:
         collection = self.get_collection(db_name=db_name, collection_name=collection_name)
         result = await collection.insert_one(entry)
@@ -81,11 +85,11 @@ class MongoHandler(BaseModel):
         cursor = collection.find(query)
         return await cursor.to_list(length=length)
 
-    async def delete_document(self, db_name: str = 'data', collection_name: str = 'url_map', filter: Optional[Dict] = None) -> DeleteResult:
+    async def delete_document(self, db_name: str = 'data', collection_name: str = 'url_map', filter: Optional[Dict] = {}) -> DeleteResult:
         collection = self.get_collection(db_name=db_name, collection_name=collection_name)
         return await collection.delete_one(filter=filter)
     
-    async def delete_documents(self, db_name: str = 'data', collection_name: str = 'url_map', filter: Optional[Dict] = None) -> DeleteResult:
+    async def delete_documents(self, db_name: str = 'data', collection_name: str = 'url_map', filter: Optional[Dict] = {}) -> DeleteResult:
         collection = self.get_collection(db_name=db_name, collection_name=collection_name)
         return await collection.delete_many(filter=filter)
 
@@ -99,3 +103,7 @@ class MongoHandler(BaseModel):
 
     def get_collection(self, db_name: str, collection_name: str):
         return self.client[db_name][collection_name]
+    
+
+    async def cleanup(self, db_name: str, collection_name: str) -> DeleteResult:
+        return await self.delete_documents(db_name=db_name, collection_name=collection_name)

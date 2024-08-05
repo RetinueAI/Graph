@@ -1,11 +1,19 @@
 from datetime import datetime, timezone, timedelta
-from dateutil import parser
 import os
 import json
-from typing import Dict, Optional, List, Tuple, Any, Union
+import gc
+import time
+from bson import encode, ObjectId
+from bson.json_util import dumps, loads
+from typing import Dict, Optional, List, Tuple, Any, Union, Generator, AsyncGenerator
 import uuid
 import random
+import asyncio
+import psutil
+import struct
 
+from tqdm import tqdm
+from dateutil import parser
 import numpy as np
 import torch
 from torch_geometric.data import Data
@@ -47,26 +55,6 @@ class Node(BaseModel):
             (datetime.now(timezone.utc) - self.last_engagement).total_seconds()
         ]
 
-class Edge(BaseModel):
-    from_node: List[int]
-    to_node: List[int]
-    interaction_strength: int = Field(default=0)
-    last_interaction: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    contextual_similarity: float = Field(default=0.0)
-    sequential_relation: float = Field(default=0.0)
-
-    def update_interaction(self):
-        self.interaction_strength += 1
-        self.last_interaction = datetime.now(timezone.utc)
-
-    def to_feature_vector(self):
-        return [
-            self.interaction_strength,
-            self.contextual_similarity,
-            self.sequential_relation,
-            (datetime.now(timezone.utc) - self.last_interaction).total_seconds()
-        ]
-
 
 class NodeMap(BaseModel):
     nodes: Dict[int, Node] = Field(default_factory=dict)
@@ -80,15 +68,124 @@ class NodeMap(BaseModel):
     
     class Config:
         arbitrary_types_allowed = True
-    
+
+
+class EdgeMap:
+    def __init__(self):
+        self.path_to_id = {}
+        self.id_to_path = {}
+        self.counter = 0
+
+    def get_id(self, path: Tuple[int, ...]) -> int:
+        if path not in self.path_to_id:
+            self.counter += 1
+            self.path_to_id[path] = self.counter
+            self.id_to_path[self.counter] = path
+        return self.path_to_id[path]
+
+    def get_path(self, id: int) -> Tuple[int, ...]:
+        return self.id_to_path[id]
+
+class Edge(BaseModel):
+    from_node: int
+    to_node: int
+    data: bytearray = Field(default=bytearray(10))
+
+    class Config:
+        arbitrary_types_allowed = True
+
+    def update_interaction(self):
+        strength = min(65535, self.get_interaction_strength() + 1)
+        self.set_interaction_strength(strength)
+        self.set_last_interaction(int(datetime.now(timezone.utc).timestamp()))
+
+    def get_interaction_strength(self) -> int:
+        return struct.unpack_from('H', self.data, 0)[0]
+
+    def set_interaction_strength(self, value: int):
+        struct.pack_into('H', self.data, 0, value)
+
+    def get_last_interaction(self) -> int:
+        return struct.unpack_from('I', self.data, 2)[0]
+
+    def set_last_interaction(self, value: int):
+        struct.pack_into('I', self.data, 2, value)
+
+    def get_contextual_similarity(self) -> float:
+        return struct.unpack_from('H', self.data, 6)[0] / 65535.0
+
+    def set_contextual_similarity(self, value: float):
+        struct.pack_into('H', self.data, 6, int(value * 65535))
+
+    def get_sequential_relation(self) -> float:
+        return struct.unpack_from('H', self.data, 8)[0] / 65535.0
+
+    def set_sequential_relation(self, value: float):
+        struct.pack_into('H', self.data, 8, int(value * 65535))
+
+    def to_dict(self):
+        return {
+            "f": self.from_node,
+            "t": self.to_node,
+            "d": self.data.hex()
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]):
+        edge = cls(data['f'], data['t'])
+        edge.data = bytearray.fromhex(data['d'])
+        return edge
 
 class Edges(BaseModel):
-    edges: Dict[Tuple[Tuple[int, ...], Tuple[int, ...]], Edge] = Field(default_factory=dict)
+    edges: Dict[Tuple[int, int], Edge] = Field(default_factory=dict)
+    edge_map: EdgeMap = Field(default_factory=EdgeMap)
 
+    class Config:
+        arbitrary_types_allowed = True
 
     def get_edge(self, _from: Tuple[int, ...], _to: Tuple[int, ...]) -> Edge:
-        return self.edges[(_from, _to)]
+        from_id = self.edge_map.get_id(_from)
+        to_id = self.edge_map.get_id(_to)
+        return self.edges[(from_id, to_id)]
 
+    def add_edge(self, from_: Tuple[int, ...], to_: Tuple[int, ...]) -> None:
+        from_id = self.edge_map.get_id(from_)
+        to_id = self.edge_map.get_id(to_)
+        if (from_id, to_id) in self.edges:
+            raise ValueError("Edge already exists")
+        edge = Edge(from_node=from_id, to_node=to_id)
+        self.edges[(from_id, to_id)] = edge
+
+    def to_dict(self):
+        return {
+            "edges": {f"{k[0]},{k[1]}": v.to_dict() for k, v in self.edges.items()},
+            "mapping": {str(k): v for k, v in self.edge_map.id_to_path.items()}
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]):
+        edges = cls()
+        for key, value in data["edges"].items():
+            from_id, to_id = map(int, key.split(','))
+            edges.edges[(from_id, to_id)] = Edge.from_dict(value)
+        edges.edge_map.id_to_path = {int(k): tuple(v) for k, v in data["mapping"].items()}
+        edges.edge_map.path_to_id = {v: k for k, v in edges.edge_map.id_to_path.items()}
+        edges.edge_map.counter = max(edges.edge_map.id_to_path.keys(), default=0)
+        return edges
+
+    def generate_edge_key(self, from_: List[str], to_: List[str], root_graph: 'Graph') -> Tuple[int, int]:
+        from_path = self.convert_str_list(from_, root_graph)
+        to_path = self.convert_str_list(to_, root_graph)
+        return (self.edge_map.get_id(from_path), self.edge_map.get_id(to_path))
+
+    def add_edge_from_str(self, from_: List[str], to_: List[str], root_graph: 'Graph') -> None:
+        edge_key = self.generate_edge_key(from_, to_, root_graph)
+        
+        if edge_key in self.edges:
+            raise ValueError("Edge already exists")
+
+        edge = Edge(from_node=edge_key[0], to_node=edge_key[1])
+        self.edges[edge_key] = edge
 
     def convert_str_list(self, str_list: List[str], graph: 'Graph') -> Tuple[int]:
         if len(str_list) < 1:
@@ -112,25 +209,6 @@ class Edges(BaseModel):
             )
 
         return tuple(int_list)
-
-
-    def generate_edge_key(self, from_: List[str], to_: List[str], root_graph: 'Graph') -> Tuple[Tuple[int],Tuple[int]]:
-        return (self.convert_str_list(from_, root_graph), self.convert_str_list(to_, root_graph))
-
-
-    def add_edge_from_str(self, from_: List[str], to_: List[str], root_graph: 'Graph') -> None:
-        edge_key = self.generate_edge_key(from_, to_, root_graph)
-
-        
-        if edge_key in self.edges:
-            raise ValueError("Edge already exists")
-
-        edge = Edge(from_node=edge_key[0], to_node=edge_key[1])
-        self.edges[edge_key] = edge
-
-
-    class Config:
-        arbitrary_types_allowed = True
 
 
 class Graph(BaseModel):
@@ -171,7 +249,7 @@ class Graph(BaseModel):
 
     def update_edge_interaction(self, _from: Tuple[int, ...], _to: Tuple[int, ...]):
         edge_key = (_from, _to)
-        if edge_key in self.edges:
+        if edge_key in self.edges.edges:
             self.edges.edges[edge_key].update_interaction()
 
 
@@ -197,15 +275,9 @@ class Graph(BaseModel):
                        for k, v in node.model_dump(exclude={"subgraph"}).items()},
                     "subgraph_id": node.subgraph.id if node.subgraph else None
                 } for node_id, node in self.node_map.nodes.items()
-            },
-            "edges": {
-                f"{from_node},{to_node}": {
-                    k: (v.isoformat() if isinstance(v, datetime) else v) 
-                    for k, v in edge.model_dump().items()
-                } 
-                for (from_node, to_node), edge in self.edges.edges.items()
             }
         }
+
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]):
@@ -219,15 +291,6 @@ class Graph(BaseModel):
                 node = Node(**parsed_node_data)
                 graph.node_map.nodes[int(node_id)] = node
             
-            for edge_key, edge_data in data['edges'].items():
-                from_node, to_node = map(int, edge_key.split(','))
-                parsed_edge_data = {
-                    k: (parser.isoparse(v) if isinstance(v, str) and k in ['last_interaction'] else v)
-                    for k, v in edge_data.items()
-                }
-                edge = Edge(**parsed_edge_data)
-                graph.edges[(from_node, to_node)] = edge
-            
 
         except Exception as e:
             print(f"Error in from_dict: {e}")
@@ -238,6 +301,7 @@ class Graph(BaseModel):
 
 class GraphSync(BaseModel):
     graph: Graph
+    user_id: str 
     graph_map: Dict = Field(default={})
     mongo_handler: MongoHandler
     local_storage_path: str
@@ -246,11 +310,11 @@ class GraphSync(BaseModel):
     class Config:
         arbitrary_types_allowed = True
 
-    async def apply_changes(self, changes: List[Dict]):
+    async def _apply_changes(self, changes: List[Dict]):
         for change in changes:
-            await self.apply_change_recursive(self.graph, change)
+            await self._apply_change_recursive(self.graph, change)
 
-    async def apply_change_recursive(self, graph: Graph, change: Dict[str, Any]):
+    async def _apply_change_recursive(self, graph: Graph, change: Dict[str, Any]):
         if change['type'] == 'add_node':
             node = graph.add_node(change['node_id'], change['node_data']['name'])
             for key, value in change['node_data'].items():
@@ -260,7 +324,7 @@ class GraphSync(BaseModel):
                 subgraph = Graph()
                 node.set_subgraph(subgraph)
                 for subchange in change['node_data']['subgraph']:
-                    await self.apply_change_recursive(subgraph, subchange)
+                    await self._apply_change_recursive(subgraph, subchange)
 
         elif change['type'] == 'update_node':
             node = graph.node_map.nodes[change['node_id']]
@@ -271,7 +335,7 @@ class GraphSync(BaseModel):
                 if node.subgraph is None:
                     node.set_subgraph(Graph())
                 for subchange in change['node_data']['subgraph']:
-                    await self.apply_change_recursive(node.subgraph, subchange)
+                    await self._apply_change_recursive(node.subgraph, subchange)
 
         elif change['type'] == 'add_edge':
             graph.edges.add_edge_from_str(change['from_node'], change['to_node'])
@@ -285,100 +349,255 @@ class GraphSync(BaseModel):
             graph.edges.edges.pop((change['from_node'], change['to_node']), None)
 
 
-    async def save_graphs_to_database(self, main_graph: Graph) -> InsertManyResult:
-        graphs_to_save = self.collect_graphs(main_graph)
+    async def _save_graphs_to_database(self, main_graph: Graph) -> List[InsertManyResult]:
+        graph_size = len(encode({"_id": main_graph.id, "graph": main_graph.to_dict()}))
+        max_batch_size = 48 * 1024 * 1024  # 48 MB
+        batch_size = max(1, max_batch_size // graph_size)
+
+        batch_generator = self._collect_graphs(graph=main_graph, batch_size=batch_size)
         
-        return await self.mongo_handler.insert_many(
-            entries=graphs_to_save,
-            db_name='Graph',
-            collection_name='Graphs'
-        )
+        results = []
+
+        for batch in batch_generator:
+            result = await self.mongo_handler.insert_many(
+                entries=batch,
+                db_name='Graph',
+                collection_name='Graphs'
+            )
+            results.append(result)
+            # Explicitly call garbage collection to free up memory
+            gc.collect()
+            await asyncio.sleep(0)  # Yield control to the event loop
+
+        return results
 
 
-    def collect_graphs(self, graph: Graph) -> List[Dict[str, Any]]:
-        graphs = [{'_id': graph.id, 'graph': graph.to_dict()}]
+    def _collect_graphs(self, graph: Graph, batch_size: int) -> Generator[List[Dict[str, Any]], None, None]:
+        def _collect(graph: Graph) -> Generator[Dict[str, Any], None, None]:
+            yield {'_id': graph.id, 'graph': graph.to_dict()}
 
-        for node in graph.node_map.nodes.values():
-            if node.subgraph:
-                graphs.extend(self.collect_graphs(node.subgraph))
+            for node in graph.node_map.nodes.values():
+                if node.subgraph:
+                    yield from _collect(node.subgraph)
 
-        return graphs
+        batch = []
+        for g in _collect(graph):
+            batch.append(g)
+            if len(batch) == batch_size:
+                yield batch
+                batch = []
+
+        if batch:
+            yield batch
+
+
+    async def _save_edges_to_database(self, edges: Edges) -> List[InsertManyResult]:
+        (from_node, to_node), edge = next(iter(self.graph.edges.edges.items()))
+        edge_dict = edge.to_dict()
+        graph_size = len(encode({"from_node": from_node, "to_node": to_node, "user_id": self.user_id, "edge": edge_dict}))
+        max_batch_size = 48 * 1024 * 1024  # 48 MB
+        batch_size = max(1, max_batch_size // graph_size)
+
+        batch_generator = self._collect_edges(edges=edges, batch_size=batch_size)
+        total_edges = len(edges.edges)
+
+        results = []
+        with tqdm(total=total_edges, desc="Saving edges") as pbar:
+            for batch in batch_generator:
+                result = await self.mongo_handler.insert_many(
+                    entries=batch,
+                    db_name='Graph',
+                    collection_name='Edges'
+                )
+                results.append(result)
+                pbar.update(len(batch))
+                gc.collect()
+                await asyncio.sleep(0)
+
+        return results
+
+    def _collect_edges(self, edges: Edges, batch_size: int) -> Generator[List[Dict[str, Any]], None, None]:
+        batch = []
+
+        for (from_node, to_node), edge in edges.edges.items():
+            batch.append({'from_node': from_node, 'to_node': to_node, 'user_id': self.user_id, 'edge': edge.to_dict()})
+            if len(batch) == batch_size:
+                yield batch
+                batch = []
+
+        if batch:
+            yield batch
     
 
-    async def save_map_to_database(self) -> InsertOneResult:
+    async def _save_map_to_database(self) -> InsertOneResult:
         exists = await self.mongo_handler.document_exists(
             db_name='Graph', 
             collection_name='Maps', 
-            filter={'_id': self.graph.user_id}
+            filter={'_id': self.user_id}
         )
 
         if exists:
             return await self.mongo_handler.update_document(
-                entry={'_id': self.graph.user_id, 'map': self.graph_map}, 
-                query={'_id': self.graph.user_id}, 
+                entry={'_id': self.user_id, 'map': self.graph_map}, 
+                query={'_id': self.user_id}, 
                 db_name='Graph', 
                 collection_name='Maps'
             )
         else:
             return await self.mongo_handler.insert(
-                entry={'_id': self.graph.user_id, 'map': self.graph_map}, 
+                entry={'_id': self.user_id, 'map': self.graph_map}, 
                 db_name='Graph', 
                 collection_name='Maps'
             )
         
 
-    async def load_graph_map_from_database(self) -> Optional[Dict]:
+    async def _save_edge_mapper(self, edge_map: EdgeMap) -> InsertOneResult:
+        exists = await self.mongo_handler.document_exists(
+            db_name='Graph',
+            collection_name='EdgeMap',
+            filter={'_id': self.user_id}
+        )
+
+        map_entry = {
+            '_id': self.user_id,
+            'id_to_path': edge_map.id_to_path,
+            'counter': edge_map.counter
+        }
+
+        if exists:
+            return await self.mongo_handler.update_document(
+                entry={'_id': self.user_id, 'map': map_entry},
+                query={'_id': self.user_id},
+                db_name='Graph',
+                collection_name='EdgeMap'
+            )
+        else:
+            return await self.mongo_handler.insert(
+                entry={'_id': self.user_id, 'map': map_entry},
+                db_name='Graph',
+                collection_name='EdgeMap'
+            )
+
+
+    async def _load_graphs_from_database(self) -> bool:
+        try:
+            await self._load_graph_map_from_database()
+
+            main_graph_id = self.graph.id
+            main_graph_map = self.graph_map[main_graph_id]
+
+            self.graph = await self._load_and_reconstruct_graph(main_graph_id, main_graph_map)
+            return True
+        except Exception as e:
+            print(f"Error loading graphs: {e}")
+            raise
+
+    async def _load_and_reconstruct_graph(self, graph_id: str, graph_map: Dict) -> Graph:
+        # Fetch the graph document
+        graph_doc = await self.mongo_handler.get_document(
+            db_name='Graph',
+            collection_name='Graphs',
+            filter={'_id': graph_id}
+        )
+
+        if not graph_doc:
+            raise ValueError(f"Graph with id {graph_id} not found")
+
+        # Create the graph object
+        graph = Graph(user_id=self.user_id).from_dict(graph_doc['graph'])
+
+        # Recursively load and set subgraphs
+        for node, subgraph_info in graph_map.items():
+            subgraph_id = list(subgraph_info.keys())[0]
+            subgraph = await self._load_and_reconstruct_graph(subgraph_id, subgraph_info[subgraph_id])
+            graph.set_node_subgraph(int(node), subgraph=subgraph)
+
+        return graph
+    
+
+    async def _load_edges_from_database(self, user_id: str) -> Edges:
+        edges = Edges()
+        batch_size = 1000  # Adjust this value based on your system's memory constraints
+        
+        total_edges = await self.mongo_handler.count_documents(db_name='Graph', collection_name='Edges')
+
+        with tqdm(total=total_edges, desc="Loading edges") as pbar:
+            async for edge_batch in self._load_edges_in_batches(user_id, batch_size):
+                for edge_doc in edge_batch:
+                    from_node = edge_doc['from_node']
+                    to_node = edge_doc['to_node']
+                    edge = Edge.from_dict(edge_doc['edge'])
+                    edges.edges[(from_node, to_node)] = edge
+                
+                pbar.update(len(edge_batch))
+                gc.collect()
+                await asyncio.sleep(0)
+        
+        return edges
+
+    async def _load_edges_in_batches(self, user_id: str, batch_size: int) -> AsyncGenerator[List[Dict[str, Any]], None]:
+        cursor = self.mongo_handler.get_documents(
+            db_name='Graph',
+            collection_name='Edges',
+            query={'user_id': user_id},
+            batch_size=batch_size
+        )
+
+        batch = []
+        async for edge_doc in cursor:
+            batch.append(edge_doc)
+            if len(batch) == batch_size:
+                yield batch
+                batch = []
+
+        if batch:
+            yield batch
+
+
+    async def _load_graph_map_from_database(self) -> Optional[Dict]:
         result = await self.mongo_handler.get_document(
             db_name='Graph', 
             collection_name='Maps', 
-            filter={'_id': self.graph.user_id}
+            filter={'_id': self.user_id}
         )
+
+        if not result['map']:
+            raise ValueError(f"No graph map found for user {self.user_id}")
          
-        return result['map']
+        self.graph_map = result['map']
 
 
-    async def load_graphs_from_database(self, user_id: str) -> bool:
-        try:
-            graphs = await self.mongo_handler.get_documents(
-                db_name='Graph',
-                collection_name='Graphs',
-                query={"graph.user_id": user_id},
-                length=None
-            )
+    async def _load_edge_mapper(self, user_id: str) -> EdgeMap:
+        result = await self.mongo_handler.get_document(
+            db_name='Graph',
+            collection_name='EdgeMap',
+            filter={'_id': user_id}
+        )
+        
+        if not result:
+            raise ValueError(f"EdgeMap for user {user_id} not found")
 
-            if not graphs:
-                raise ValueError(f"No graphs found for user {user_id}")
+        edge_map = EdgeMap()
+        map_data = result['map']
+        edge_map.id_to_path = map_data['id_to_path']
+        edge_map.path_to_id = {tuple(v): k for k, v in edge_map.id_to_path.items()}
+        edge_map.counter = map_data['counter']
+        
+        return edge_map
 
-            graphs = {graph['_id']: graph['graph'] for graph in graphs}
 
-            graph = Graph(user_id=user_id).from_dict(graphs[self.graph.id])
-            graph_map = await self.load_graph_map_from_database()
-            self.graph_map = graph_map
+    async def save_to_database(self) -> Tuple[List[InsertManyResult],List[InsertManyResult], InsertOneResult]:
+        graphs_result = await self._save_graphs_to_database(main_graph=self.graph)
+        edges_result = await self._save_edges_to_database(edges=self.graph.edges)
+        map_result = await self._save_map_to_database()
 
-            try:
-                await self.reconstruct_graph(graph=graph, graphs=graphs, graph_map=graph_map[self.graph.id])
-            except Exception as e:
-                print(e)
-                raise
+        return (graphs_result, edges_result, map_result)
 
-            self.graph = graph
-            return True
-        except Exception as e:
-            print(e)
-            raise
 
-    async def reconstruct_graph(self, graph: Graph, graphs: Dict[str, Graph], graph_map: Dict[str, str]):
-        # TODO Make sense of what's going on here.
-        # TODO Needs to work with the new Edge implementation.
-        for node in graph_map.keys():
-            try:
-                graph_id = list(graph_map[node].keys())[0] 
-                graph.set_node_subgraph(int(node), subgraph=graphs[graph_id])
-            except Exception as e:
-                print(e)
-                raise
-
-            await self.reconstruct_graph(graph=graph.node_map.nodes[int(node)].subgraph, graphs=graphs, graph_map=graph_map[node][graph_id])
+    async def load_from_database(self):
+        await self._load_graphs_from_database()
+        self.graph.edges = await self._load_edges_from_database(user_id=self.user_id)
+    
 
 
 class GraphRandomizer(BaseModel):

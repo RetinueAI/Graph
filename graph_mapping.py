@@ -4,30 +4,18 @@ import asyncio
 import uuid
 from typing import Dict, Tuple
 
-from geo_graph import Graph, Node, Edge, GraphSync, GraphRandomizer, GraphPresenter
+from geo_graph import Graph, Node, Edge, GraphSync, GraphRandomizer
+from generate_graph import generate_graph
 from mongo import MongoHandler
 
 
 
-def generate_graph(graph: Graph, categories: Dict):
 
-    for i, parent in enumerate(categories.keys()):
-        graph.add_node(i, parent)
-
-        if len(categories[parent]) > 0:
-            graph.set_node_subgraph(i, subgraph=Graph(user_id=graph.user_id))
-            generate_graph(graph=graph.nodes[i].subgraph, categories=categories[parent])
-
-    for j in range(len(graph.nodes)):
-        for k in range(len(graph.nodes)):
-            if j != k:
-                graph.add_edge(j, k)
-                graph.add_edge(k, j)
 
 
 def map_graph(graph: Graph, graph_map: Dict) -> None:
 
-    for node in graph.nodes.values():
+    for node in graph.node_map.nodes.values():
         if node.subgraph:
             graph_map[str(node.id)] = {node.subgraph.id: {}}
             map_graph(graph=node.subgraph, graph_map=graph_map[str(node.id)][node.subgraph.id])
@@ -44,10 +32,10 @@ def check_mapping(graph: Graph, graph_map: Dict) -> int:
     count = 0
 
     for node in graph_map.keys():
-        if graph.nodes[int(node)].subgraph:
-            count += check_id(graph.nodes[int(node)].subgraph.id, graph_map[node])
+        if graph.node_map.nodes[int(node)].subgraph:
+            count += check_id(graph.node_map.nodes[int(node)].subgraph.id, graph_map[node])
 
-            count += check_mapping(graph=graph.nodes[int(node)].subgraph, graph_map=graph_map[node][list(graph_map[node].keys())[0]])
+            count += check_mapping(graph=graph.node_map.nodes[int(node)].subgraph, graph_map=graph_map[node][list(graph_map[node].keys())[0]])
 
     return count
 
@@ -55,14 +43,14 @@ def check_mapping(graph: Graph, graph_map: Dict) -> int:
 def compare_graphs(x: Graph, y: Graph) -> bool:
     state = True
 
-    x_len = len(x.nodes)
-    y_len = len(y.nodes)
+    x_len = len(x.node_map.nodes)
+    y_len = len(y.node_map.nodes)
 
     if x_len == y_len:
         for i in range(x_len):
-            if x.nodes[i].name == y.nodes[i].name:
-                if (x.nodes[i].subgraph != None) and (y.nodes[i].subgraph != None):
-                    if not compare_graphs(x.nodes[i].subgraph, y.nodes[i].subgraph):
+            if x.node_map.nodes[i].name == y.node_map.nodes[i].name:
+                if (x.node_map.nodes[i].subgraph != None) and (y.node_map.nodes[i].subgraph != None):
+                    if not compare_graphs(x.node_map.nodes[i].subgraph, y.node_map.nodes[i].subgraph):
                         return False
             else:
                 return False
@@ -109,10 +97,6 @@ async def main():
     randomizer = GraphRandomizer()
 
     randomizer.simulate_usage_recursive(graph=graph, days=180, max_daily_interactions=60)
-
-    presenter = GraphPresenter()
-
-    presenter.display_simulation_results(graph=graph)
 
     # graphs = graph_sync.collect_graphs(graph_sync.graph)
 
