@@ -1,6 +1,6 @@
 from typing import List
 
-from geo_graph import Graph
+from graph import Graph
 
 
 def generate_graph(graph: Graph, categories: dict[str,dict]) -> None:
@@ -14,7 +14,7 @@ def _generate_graph(graph: Graph, categories: dict[str,dict]) -> None:
 
         if len(categories[parent]) > 0:
             graph.set_node_subgraph(id, subgraph=Graph(user_id=graph.user_id, edges=graph.edges))
-            _generate_graph(graph=graph.node_map.nodes[id].subgraph, categories=categories[parent])
+            _generate_graph(graph=graph.nodes.nodes[id].subgraph, categories=categories[parent])
 
 
 def _extract_edge_endpoints(categories: dict[str,dict]) -> List[str]:

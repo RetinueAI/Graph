@@ -1,15 +1,12 @@
-import json
 import os
+from time import time
+import json
 import asyncio
-import uuid
 from typing import Dict, Tuple
 
-from graph import Graph, Node, Edge, GraphSync, GraphRandomizer
 from graph_generation import generate_graph
+from graph import Graph, GraphSync
 from mongo import MongoHandler
-
-
-
 
 
 
@@ -60,6 +57,13 @@ def compare_graphs(x: Graph, y: Graph) -> bool:
     return state
 
 
+def generate_node_map(graph: Graph, node_map: Dict[Tuple[int,str], Dict]):
+    for node in graph.nodes.nodes.values():
+        if node.subgraph:
+            node_map[(node.id, graph.id)] = {}
+            generate_node_map(node.subgraph, node_map=node_map[(node.id, graph.id)])
+
+
 async def main():
 
     with open('user_id.txt', 'r') as f:
@@ -72,11 +76,20 @@ async def main():
 
     generate_graph(graph=graph, categories=categories)
 
-    print(f"Number of root nodes: {len(graph.nodes)}")
-
+    print("Graph generated")
     graph_map = {graph.id: {}}
 
-    map_graph(graph=graph, graph_map=graph_map[graph.id])
+    map_graph(graph=graph, graph_map=graph_map)
+
+    if check_mapping(graph=graph, graph_map=graph_map[graph.id]) > 0:
+        print("The graph map doesn't match the graph.")
+        return
+    else:
+        print("The graph map matches the graph, continuing!")
+
+    node_map = {}
+
+    generate_node_map(graph=graph, node_map=node_map)
 
     uri = "mongodb+srv://mimir.kjfum9z.mongodb.net/?authSource=%24external&authMechanism=MONGODB-X509&appName=Mimir"
     mongo_handler = MongoHandler(
@@ -84,56 +97,43 @@ async def main():
         cert_path='./mongocert.pem',
     )
 
+    if await mongo_handler.test_database_connection():
+        print("Database connection established!")
+    else:
+        return
+
+    # nodes_cleanup = await mongo_handler.cleanup(db_name='Graph', collection_name='Nodes')
+    # print(f"Number of documents cleaned from the Nodes collection: {nodes_cleanup}")
+    # edges_cleanup = await mongo_handler.cleanup(db_name='Graph', collection_name='Edges')
+    # print(f"Number of documents cleaned from the Edges collection: {edges_cleanup}")
+
     graph_sync = GraphSync(
         graph=graph,
+        user_id=user_id,
         graph_map=graph_map,
+        node_map=node_map,
         mongo_handler=mongo_handler,
         local_storage_path=os.path.join(os.getcwd(), 'graph_sync_timestamp.json')
     )
+    print("GraphSync initiated...")
 
-    connection = await mongo_handler.test_database_connection()
-    print(f"Connection: {connection}")
+    # saved_result = await graph_sync.save_to_database()
+    # print(f"Results from saving: {saved_result}")
 
-    randomizer = GraphRandomizer()
+    await graph_sync.load_from_database()
 
-    randomizer.simulate_usage_recursive(graph=graph, days=180, max_daily_interactions=60)
+    # nodes_cleanup = await mongo_handler.cleanup(db_name='Graph', collection_name='Nodes')
+    # print(f"Number of documents cleaned from the Nodes collection: {nodes_cleanup}")
+    # edges_cleanup = await mongo_handler.cleanup(db_name='Graph', collection_name='Edges')
+    # print(f"Number of documents cleaned from the Edges collection: {edges_cleanup}")
 
-    # graphs = graph_sync.collect_graphs(graph_sync.graph)
+    # print(type(graph))
+    # print(type(graph_sync.graph))
 
-    # print(len(graphs))
+    # compare = compare_graphs(x=graph, y=graph_sync.graph)
+    # print(f"The graphs are the same: {compare}")
 
-    # map_insert = await graph_sync.save_map_to_database()
-    # print(f'Map saved: {map_insert.acknowledged}')
 
-    # graphs_insert = await graph_sync.save_graphs_to_database(graph_sync.graph)
-    # print(f'Graphs saved: {graphs_insert.acknowledged}')
 
-    # loaded_map = await graph_sync.load_graph_map_from_database()
-    # print(loaded_map == graph_map)
-
-    # try: 
-    #     print('Loading graph')
-    #     loaded_graph = await graph_sync.load_graphs_from_database(user_id=user_id)
-
-    #     print(f'Loaded Graph: {loaded_graph}')
-
-    #     print(f"Number of loaded root nodes: {len(graph_sync.graph.nodes)}")
-
-    #     count = check_mapping(graph=graph_sync.graph, graph_map=graph_sync.graph_map[graph_sync.graph.id])
-
-    #     print(count)
-
-    #     state = compare_graphs(x=graph, y=graph_sync.graph)
-
-    #     print(f"Node names are identical: {state}")
-
-    # except Exception as e:
-    #     print(f'Error loading graph: {e}')
-    #     pass
-
-    # graphs_deleted = await mongo_handler.delete_documents(db_name='Graph', collection_name='Graphs', filter={'graph.user_id': graph.user_id})
-
-    # print(f'Graphs deleted: {graphs_deleted}')
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     asyncio.run(main())

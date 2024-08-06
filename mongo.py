@@ -58,9 +58,9 @@ class MongoHandler(BaseModel):
             self.client.close()
             logging.info("MongoDB connection closed")
 
-    async def count_documents(self, db_name: str, collection_name: str) -> int:
+    async def count_documents(self, db_name: str, collection_name: str, filter: Dict = {}) -> int:
         collection =  self.get_collection(db_name=db_name, collection_name=collection_name)
-        return await collection.count_documents()
+        return await collection.count_documents(filter=filter)
 
     async def insert(self, entry: dict, db_name: str = 'data', collection_name: str = 'url_map') -> InsertOneResult:
         collection = self.get_collection(db_name=db_name, collection_name=collection_name)

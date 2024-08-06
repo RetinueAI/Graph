@@ -10,7 +10,7 @@ import hashlib
 from motor.motor_asyncio import AsyncIOMotorCollection
 from cryptography.fernet import Fernet
 
-from geo_graph import Graph, GraphSync, Edges, Edge
+from graph import Graph, GraphSync, Edges, Edge
 from mongo import MongoHandler
 
 
@@ -22,7 +22,7 @@ def generate_graph(graph: Graph, categories: dict[str,dict]):
 
         if len(categories[parent]) > 0:
             graph.set_node_subgraph(id, subgraph=Graph(user_id=graph.user_id, edges=graph.edges))
-            generate_graph(graph=graph.node_map.nodes[id].subgraph, categories=categories[parent])
+            generate_graph(graph=graph.nodes.nodes[id].subgraph, categories=categories[parent])
 
 
 def extract_edge_endpoints(categories: dict[str,dict]) -> List[str]:
@@ -99,7 +99,7 @@ def verify_changes(graph, changes):
 
 
 def print_graph_stats(graph: Graph):
-    print(f"\nTotal nodes: {len(graph.node_map.nodes)}")
+    print(f"\nTotal nodes: {len(graph.nodes.nodes)}")
     print(f"Total edges: {len(graph.edges.edges)}")
     
 
@@ -140,7 +140,7 @@ async def main():
     print(f"Total amount of edges: {len(graph.edges.edges)}")
     print(f"Edge generation took: {edge_time}s")
 
-    print(f"\nTotal creation time: {graph_time + edge_time}s")
+    print(f"\nTotal creation time: {graph_time + edge_time}s")  
     
     # print('Graph Saved')
 
