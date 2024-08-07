@@ -528,4 +528,5 @@ class GraphSync(BaseModel):
 
 
     async def rebuild_graph(self):
+        self.node_map
         self.graph = Graph(user_id=self.user_id)

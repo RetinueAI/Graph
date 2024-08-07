@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Dict, Tuple
 
 from graph import Graph
 
@@ -41,3 +41,18 @@ def _generate_edges(root_graph: Graph, categories: dict[str,dict]) -> None:
         for j in range(len(edge_endpoints)):
             if i != j:
                 root_graph.edges.add_edge_from_str(from_=edge_endpoints[i], to_=edge_endpoints[j], root_graph=root_graph)
+
+
+def generate_node_map(graph: Graph, node_map: Dict[Tuple[int,str], Dict]):
+    for node in graph.nodes.nodes.values():
+        if node.subgraph:
+            node_map[(node.id, graph.id)] = {}
+            generate_node_map(node.subgraph, node_map=node_map[(node.id, graph.id)])
+
+
+def generate_graph_map(graph: Graph, graph_map: Dict) -> None:
+
+    for node in graph.nodes.nodes.values():
+        if node.subgraph:
+            graph_map[str(node.id)] = {node.subgraph.id: {}}
+            generate_graph_map(graph=node.subgraph, graph_map=graph_map[str(node.id)][node.subgraph.id])

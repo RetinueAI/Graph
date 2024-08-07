@@ -4,7 +4,7 @@ import json
 import asyncio
 
 from cryptography.fernet import Fernet
-from geo_graph import Graph, Node, Edge, GraphSync
+from graph import Graph, Node, Edge, GraphSync
 from mongo import MongoHandler
 
 
