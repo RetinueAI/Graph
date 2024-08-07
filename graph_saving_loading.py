@@ -5,38 +5,21 @@ import asyncio
 from typing import Dict, Tuple
 
 from graph import Graph, GraphSync
-from graph_generation import generate_graph, generate_node_map, generate_graph_map
-from graph_inspection import check_graph_mapping, check_id, compare_graphs
+from graph_generation import generate_graph, load_graph_map, generate_new_graph
+from graph_inspection import check_graph_mapping, check_id, compare_graphs, compare_edges
 from mongo import MongoHandler
 
 
 
 async def main():
 
-    with open('user_id.txt', 'r') as f:
-        user_id = f.read()
+    # graph = generate_new_graph()
+    graph_map = load_graph_map()
 
-    graph = Graph(user_id=user_id)
+    graph = Graph(user_id=graph_map['user_id'], id=graph_map['graph']['id'])
+    generate_graph(graph=graph, graph_map=graph_map['graph'])
 
-    with open('categories.json', 'r') as f:
-        categories = json.load(f)
-
-    generate_graph(graph=graph, categories=categories)
-
-    print("Graph generated")
-    graph_map = {graph.id: {}}
-
-    generate_graph_map(graph=graph, graph_map=graph_map)
-
-    if check_graph_mapping(graph=graph, graph_map=graph_map[graph.id]) > 0:
-        print("The graph map doesn't match the graph.")
-        return
-    else:
-        print("The graph map matches the graph, continuing!")
-
-    node_map = {}
-
-    generate_node_map(graph=graph, node_map=node_map)
+    print(graph.id)
 
     uri = "mongodb+srv://mimir.kjfum9z.mongodb.net/?authSource=%24external&authMechanism=MONGODB-X509&appName=Mimir"
     mongo_handler = MongoHandler(
@@ -45,7 +28,7 @@ async def main():
     )
 
     if await mongo_handler.test_database_connection():
-        print("Database connection established!")
+        print("Database connection established...")
     else:
         return
 
@@ -56,18 +39,22 @@ async def main():
 
     graph_sync = GraphSync(
         graph=graph,
-        user_id=user_id,
+        user_id=graph_map['user_id'],
         graph_map=graph_map,
-        node_map=node_map,
         mongo_handler=mongo_handler,
-        local_storage_path=os.path.join(os.getcwd(), 'graph_sync_timestamp.json')
     )
     print("GraphSync initiated...")
 
     # saved_result = await graph_sync.save_to_database()
-    # print(f"Results from saving: {saved_result}")
+    await graph_sync.save_nodes_to_local()
 
-    await graph_sync.load_from_database()
+
+    # print("Loading the graph from the database...")
+    # await graph_sync.load_graph_from_database()
+    # print("Graph loaded...")
+
+    # comparison = compare_graphs(x=graph, y=graph_sync.graph)
+    # print(f"The graphs are identical: {comparison}")
 
     # nodes_cleanup = await mongo_handler.cleanup(db_name='Graph', collection_name='Nodes')
     # print(f"Number of documents cleaned from the Nodes collection: {nodes_cleanup}")

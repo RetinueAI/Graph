@@ -5,17 +5,9 @@ import bson
 
 from graph import Graph
 from graph_generation import generate_graph
+from graph_inspection import get_n_nodes
 
-async def get_n_nodes(graph: Graph) -> int:
-    n_nodes = 0
 
-    for node in graph.nodes.nodes.values():
-        n_nodes += 1
-        
-        if node.subgraph:
-            n_nodes += await get_n_nodes(node.subgraph)
-
-    return n_nodes
 
 
 async def main():

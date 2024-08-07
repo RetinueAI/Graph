@@ -1,10 +1,10 @@
 import os
-from typing import Dict, Optional, Any, List
+from typing import Dict, Optional, Any, List, AsyncGenerator
 from pathlib import Path
 import logging
 
 from pydantic import BaseModel, model_validator
-from motor.motor_asyncio import AsyncIOMotorClient
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorCursor
 from pymongo.server_api import ServerApi
 from pymongo.results import InsertOneResult, InsertManyResult, DeleteResult, UpdateResult
 
@@ -80,10 +80,21 @@ class MongoHandler(BaseModel):
             return await collection.find_one(filter=filter, sort=sort)
         return await collection.find_one(filter=filter)
     
-    async def get_documents(self, db_name: str, collection_name: str, query: dict, length: int = None):
+    async def get_documents(self, db_name: str, collection_name: str, query: dict, length: int = None) -> AsyncGenerator[List[Dict[str, Any]], None]:
         collection = self.get_collection(db_name, collection_name)
         cursor = collection.find(query)
-        return await cursor.to_list(length=length)
+
+        while True:
+            documents = await cursor.to_list(length=length)
+
+            if not documents:
+                break
+
+            yield documents
+            
+            
+        await cursor.close()
+
 
     async def delete_document(self, db_name: str = 'data', collection_name: str = 'url_map', filter: Optional[Dict] = {}) -> DeleteResult:
         collection = self.get_collection(db_name=db_name, collection_name=collection_name)

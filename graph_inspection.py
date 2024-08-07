@@ -1,6 +1,6 @@
 from typing import Dict
 
-from graph import Graph
+from graph import Graph, Edge, Edges
 
 
 
@@ -41,3 +41,48 @@ def compare_graphs(x: Graph, y: Graph) -> bool:
         state = False
     
     return state
+
+
+def compare_edges(x: Edges, y: Edges) -> bool:
+    if len(x.edges) == len(y.edges):
+        i = 0
+        errors = 0
+        for key in x.edges.keys():
+            errors += _compare_edge(x=x.edges[key], y=y.edges[key])
+            
+            if x.edge_map.get_id(key) != y.edge_map.get_id(key):
+                errors += 1
+            if x.edge_map.get_path(x.edge_map.get_id(key)) != y.edge_map.get_path(y.edge_map.get_id(key)):
+                errors += 1
+
+        if errors == 0:
+            return True
+    else:
+        print("There's a different amount of Edges")
+        return False
+    return False
+
+
+def _compare_edge(x: Edge, y: Edge) -> int:
+    errors = 0
+
+    if x.from_node != y.from_node:
+        errors += 1
+    if x.to_node != y.to_node:
+        errors += 1
+    if x.data != y.data:
+        errors += 1
+    
+    return errors
+
+
+async def get_n_nodes(graph: Graph) -> int:
+    n_nodes = 0
+
+    for node in graph.nodes.nodes.values():
+        n_nodes += 1
+        
+        if node.subgraph:
+            n_nodes += await get_n_nodes(node.subgraph)
+
+    return n_nodes

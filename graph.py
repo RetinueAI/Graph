@@ -10,6 +10,7 @@ from typing import Dict, Optional, List, Tuple, Any, Union, Generator, AsyncGene
 import uuid
 import random
 import asyncio
+import bson.json_util
 import psutil
 import struct
 
@@ -30,8 +31,9 @@ from mongo import MongoHandler
 class Node(BaseModel):
     id: int
     name: str
+    parent: str
     data: bytearray = Field(default=bytearray(10))
-    subgraph: Optional['Graph'] = None
+    subgraph: Optional[Union['Graph',str]] = None
 
     class Config:
         arbitrary_types_allowed = True
@@ -85,13 +87,14 @@ class Node(BaseModel):
         return {
             'i': self.id,
             'n': self.name,
+            'p': self.parent,
             'd': bson.Binary(bytes(self.data)),
             's': self.subgraph.id if self.subgraph else None
         }
     
     @classmethod
     def from_dict(cls, data: Dict) -> 'Node':
-        node = cls(data['i'], data['n'])
+        node = cls(id=data['i'], name=data['n'], parent=data['p'])
         node.data = bytearray.fromhex(data['d'].hex())
         if data['s']:
             node.subgraph = data['s']
@@ -181,15 +184,15 @@ class Edge(BaseModel):
 
 
 class Edges(BaseModel):
-    edges: Dict[Tuple[int, int], Edge] = Field(default_factory=dict)
-    edge_map: EdgeMap = Field(default_factory=EdgeMap)
+    edges: Dict[Tuple[int, int], Edge] = Field(default={})
+    edge_map: EdgeMap = Field(default=EdgeMap())
 
     class Config:
         arbitrary_types_allowed = True
 
-    def get_edge(self, _from: Tuple[int, ...], _to: Tuple[int, ...]) -> Edge:
-        from_id = self.edge_map.get_id(_from)
-        to_id = self.edge_map.get_id(_to)
+    def get_edge(self, from_: Tuple[int, ...], to_: Tuple[int, ...]) -> Edge:
+        from_id = self.edge_map.get_id(from_)
+        to_id = self.edge_map.get_id(to_)
         return self.edges[(from_id, to_id)]
 
     def add_edge(self, from_: Tuple[int, ...], to_: Tuple[int, ...]) -> None:
@@ -269,7 +272,7 @@ class Graph(BaseModel):
         arbitrary_types_allowed = True
 
     def add_node(self, id: int, name: str) -> Node:
-        node = Node(id=id, name=name)
+        node = Node(id=id, name=name, parent=self.id)
         self.nodes.nodes[id] = node
         self.nodes.node_map[name] = id
         return node
@@ -306,12 +309,11 @@ class Graph(BaseModel):
 
 
 class GraphSync(BaseModel):
-    graph: Graph = Field(default=None)
-    user_id: str 
-    graph_map: Dict = Field(default={})
-    node_map: Dict = Field(default={})
+    user_id: str
     mongo_handler: MongoHandler
-    local_storage_path: str
+    local_storage_path: str = Field(default=os.path.join(os.getcwd(),'graph'))
+    graph: Graph = Field(default=None)
+    graph_map: Dict = Field(default={})
     last_sync_timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     max_batch_size: int = Field(default=48*1024*1024)
 
@@ -323,19 +325,63 @@ class GraphSync(BaseModel):
     async def generate_node_map(self):
         pass
 
+
+    async def _save_node_locally(self, node: Node):
+        path = os.path.join(self.local_storage_path, 'nodes', f'{node.parent}_{str(node.id)}.bson')
+        bson_data = bson.BSON.encode(node.to_dict())
+
+        with open(path, 'wb') as f:
+            f.write(bson_data)
+
+
+    async def _save_edge_locally(self, edge: Edge):
+        path = os.path.join(self.local_storage_path, 'edges', f'{str(edge.from_node)}_{edge.to_node}.bson')
+        bson_data = bson.BSON.encode(edge.to_dict())
+
+        with open(path, 'wb') as f:
+            f.write(bson_data)
+
+
+    async def save_nodes_to_local(self) -> bool:
+        n_nodes = await self._count_total_nodes(nodes=self.graph.nodes)
+        return await self._save_nodes_to_local(nodes=self.graph.nodes, n_nodes=n_nodes)
+
+
+    async def _save_nodes_to_local(self, nodes: Nodes, n_nodes: int, pbar = None) -> bool:
+
+        if pbar is None:
+            pbar = tqdm(total=n_nodes, desc="Saving nodes to local storage...")
+        
+        try:
+            for node in nodes.nodes.values():
+                try:
+                    await self._save_node_locally(node)
+                except Exception as e:
+                    print(e)
+                    return False
+                
+                if node.subgraph:
+                    await self._save_nodes_to_local(node.subgraph.nodes, n_nodes=n_nodes)
+                pbar.update()
+        finally:
+            if pbar.total == n_nodes:
+                pbar.close()
+        
+        return True
+
     
     async def _save_nodes_to_database(self, nodes: Nodes) -> List[InsertManyResult]:
-        node = next(iter(self.graph.nodes.nodes.values()))
+        node = next(iter(nodes.nodes.values()))
         document = node.to_dict()
         node_size = len(document)
         batch_size = max(1, self.max_batch_size // node_size)
 
-        node_generator = self._collect_nodes(nodes=nodes, batch_size=batch_size)
+        node_generator = self._generate_batched_nodes(nodes=nodes, batch_size=batch_size)
         total_nodes = await self._count_total_nodes(nodes)
 
         results = []
         with tqdm(total=total_nodes, desc="Saving nodes") as pbar:
-            for batch in node_generator:
+            async for batch in node_generator:
                 result = await self.mongo_handler.insert_many(
                     entries=batch,
                     db_name='Graph',
@@ -348,20 +394,53 @@ class GraphSync(BaseModel):
         return results
     
 
+    async def collect(self, node: Node) -> List[Dict]:
+        nodes = [node.to_dict()]
+
+        if node.subgraph:
+            for sub_node in node.subgraph.nodes.nodes.values():
+                nodes.extend(await self.collect(sub_node))
+
+        return nodes
+
+
+    async def _generate_batched_nodes(self, nodes: Nodes, batch_size: int) -> AsyncGenerator[List[Dict], None]:
+        all_nodes = []
+        batch = []          
+
+        for node in nodes.nodes.values():
+            print(node.parent)
+            all_nodes.extend(await self.collect(node=node))
+
+        for node in all_nodes:
+            batch.append(node)
+
+            if len(batch) == batch_size:
+                yield batch
+                batch = []
+
+        if batch:
+            yield batch
+
+
     async def _count_total_nodes(self, nodes: Nodes) -> int:
         async def count_recursive(node_collection: Nodes):
             count = len(node_collection.nodes.values())
             for node in node_collection.nodes.values():
                 if node.subgraph:
-                    count += await count_recursive(node.subgraph)
+                    count += await count_recursive(node.subgraph.nodes)
             return count
 
         return await count_recursive(nodes)
 
 
+    async def _save_edges_to_local(self, edges: Edges) -> bool:
+        pass
+
+
     async def _save_edges_to_database(self, edges: Edges) -> List[InsertManyResult]:
         edge = next(iter(self.graph.edges.edges.values()))
-        document = await edge.to_dict()
+        document = edge.to_dict()
         edge_size = len(document)
         batch_size = max(1, self.max_batch_size // edge_size)
 
@@ -370,7 +449,7 @@ class GraphSync(BaseModel):
 
         results = []
         with tqdm(total=total_edges, desc="Saving edges") as pbar:
-            async for batch in edge_generator:
+            for batch in edge_generator:
                 result = await self.mongo_handler.insert_many(
                     entries=batch,
                     db_name='Graph',
@@ -383,28 +462,6 @@ class GraphSync(BaseModel):
 
         return results
 
-
-    async def _collect_nodes(self, nodes: Nodes, batch_size: int) -> AsyncGenerator[List[Dict], None]:
-        batch = []
-
-        async def collect(node: Node):
-            nonlocal batch
-            batch.append(await node.to_dict())
-            if len(batch) == batch_size:
-                yield batch
-                batch.clear()
-            
-            if node.subgraph:
-                async for sub_batch in self._collect_nodes(node.subgraph, batch_size):
-                    yield sub_batch
-
-        for node in nodes.nodes.values():
-            async for sub_batch in collect(node):
-                yield sub_batch
-
-        if batch:
-            yield batch
-
     
     def _collect_edges(self, edges: Edges, batch_size: int) -> Generator[List[Dict], None, None]:
         batch = []
@@ -414,10 +471,72 @@ class GraphSync(BaseModel):
             if len(batch) == batch_size:
                 yield batch
                 batch = []
-                gc.collect()
 
         if batch:
             yield batch
+
+
+    async def save_to_database(self) -> Tuple[List[InsertManyResult], List[InsertManyResult]]:
+        print("Saving to database.")
+
+        print(f"self.graph.id = {self.graph.id}")
+        node = next(iter(self.graph.nodes.nodes.values()))
+        print(f"node parent in self.graph = {node.parent}")
+
+        nodes_result = await self._save_nodes_to_database(nodes=self.graph.nodes)
+        # edges_result = await self._save_edges_to_database(edges=self.graph.edges)
+
+        return (nodes_result, None)
+        # return (nodes_result, edges_result)
+
+
+    async def _load_node_from_database(self, node_id: int, node_name: str) -> Node:
+        node_document = await self.mongo_handler.get_document(
+            db_name='Graph',
+            collection_name='Nodes',
+            filter={'i': node_id, 'n': node_name}
+        )
+
+        if node_document:
+            return Node.from_dict(node_document)
+        return None
+        
+
+    async def load_edge_from_database(self, from_node: int, to_node: int) -> Edge:
+        edge_document = await self.mongo_handler.get_document(
+            db_name='Graph',
+            collection_name='Nodes',
+            filter={
+                'f': from_node,
+                'n': to_node
+            }
+        )
+
+        if edge_document:
+            return Edge.from_dict(edge_document)
+        return None
+
+
+    async def _load_node_from_local(self, node_id: int, node_name: str) -> Node:
+        node_storage_path = os.path.join(self.local_storage_path, 'nodes')
+        filename = f"{str(node_id)}_{node_name}.bson"
+
+        if filename in os.listdir(node_storage_path):
+            with open(os.path.join(node_storage_path, filename), 'rb') as f:
+                bson_data = f.read()
+
+        return Node.from_dict(bson.BSON(bson_data).decode())
+    
+
+    async def _load_edge_from_local(self, from_node: int, to_node: int) -> Edge:
+        node_storage_path = os.path.join(self.local_storage_path, 'nodes')
+        filename = f"{str(from_node)}_{to_node}.bson"
+
+        if filename in os.listdir(node_storage_path):
+            with open(os.path.join(node_storage_path, filename), 'rb') as f:
+                bson_data = f.read()
+
+        return Edge.from_dict(bson.BSON(bson_data).decode())
 
 
     async def _load_nodes_from_database(self) -> Nodes:
@@ -432,11 +551,20 @@ class GraphSync(BaseModel):
                     node = Node.from_dict(node_doc)
                     nodes.nodes[node.id] = node
                     pbar.update(len(node_batch))
+    
+
+    async def _load_graph_nodes_from_database(self, graph_id: str, batch_size: int) -> AsyncGenerator[List[Dict[str, Any]], None]:
+        yield self.mongo_handler.get_documents(
+            db_name='Graph',
+            collection_name='Nodes',
+            query={'p':graph_id},
+            length=None
+        )
 
 
     async def _load_edges_from_database(self) -> Edges:
         edges = Edges()
-        batch_size = 1000  # Adjust this value based on your system's memory constraints
+        batch_size = 1000
         
         total_edges = await self.mongo_handler.count_documents(db_name='Graph', collection_name='Edges')
 
@@ -456,43 +584,21 @@ class GraphSync(BaseModel):
     
 
     async def _load_nodes_in_batches(self, batch_size: int) -> AsyncGenerator[List[Dict[str, Any]], None]:
-        cursor =  self.mongo_handler.get_documents(
+        return self.mongo_handler.get_documents(
             db_name='Graph',
             collection_name='Nodes',
             query={'user_id': self.user_id},
-            batch_size=batch_size
+            length=batch_size
         )
-
-        batch = []
-        async for node_doc in cursor:
-            batch.append(node_doc)
-            if len(batch) == batch_size:
-                yield batch
-                batch = []
-                gc.collect()
-
-        if batch:
-            yield batch
 
 
     async def _load_edges_in_batches(self, batch_size: int) -> AsyncGenerator[List[Dict[str, Any]], None]:
-        cursor = self.mongo_handler.get_documents(
+        return await self.mongo_handler.get_documents(
             db_name='Graph',
             collection_name='Edges',
             query={'user_id': self.user_id},
-            batch_size=batch_size
+            length=batch_size
         )
-
-        batch = []
-        async for edge_doc in cursor:
-            batch.append(edge_doc)
-            if len(batch) == batch_size:
-                yield batch
-                batch = []
-                gc.collect()
-
-        if batch:
-            yield batch
 
 
     async def _load_graph_map_from_database(self) -> Optional[Dict]:
@@ -508,15 +614,6 @@ class GraphSync(BaseModel):
         self.graph_map = result['map']
 
 
-    async def save_to_database(self) -> Tuple[List[InsertManyResult], List[InsertManyResult]]:
-        print("Saving to database.")
-
-        nodes_result = await self._save_nodes_to_database(nodes=self.graph.nodes)
-        edges_result = await self._save_edges_to_database(edges=self.graph.edges)
-
-        return (nodes_result, edges_result)
-
-
     async def load_from_database(self):
         print("Loading from database")
 
@@ -527,6 +624,59 @@ class GraphSync(BaseModel):
         print(f"Number of edges loaded: {len(edges.edges)}")
 
 
-    async def rebuild_graph(self):
-        self.node_map
-        self.graph = Graph(user_id=self.user_id)
+
+    async def load_graph_from_database(self):
+        self.graph = await self._rebuild_graph(graph_id=self.graph_map['graph']['id'], root=True)
+        # self.graph.edges = await self._load_edges_from_database()
+
+
+    async def _add_subgraphs(self, graph: Graph) -> None:
+        for node in graph.nodes.nodes.values():
+            if node.subgraph:
+                node.subgraph = await self._rebuild_graph(graph_id=node.subgraph)
+
+
+    async def fetch_graph_nodes(self, graph_id: str):
+        batched_nodes = self.mongo_handler.get_documents(
+            db_name='Graph',
+            collection_name='Nodes',
+            query={'p': graph_id},
+            length=50
+        )
+
+        graph_nodes = []
+
+        async for batch in batched_nodes:
+            graph_nodes.extend(batch)
+
+        return graph_nodes
+
+
+    async def _rebuild_graph(self, graph_id: str, root: bool = False) -> Graph:
+
+        graph = Graph(
+            id=graph_id,
+            user_id=self.user_id, 
+            root=root,
+        )
+
+        graph_nodes = await self.fetch_graph_nodes(graph_id=graph_id)
+
+        nodes_nodes = {}
+        node_map = {}
+
+        for graph_node in graph_nodes:
+            node = Node.from_dict(graph_node)
+            nodes_nodes[node.id] = node
+            node_map[node.name] = node.id
+
+        nodes = Nodes(
+            nodes=nodes_nodes,
+            node_map=node_map
+        )
+
+        graph.nodes = nodes
+
+        await self._add_subgraphs(graph=graph)
+
+        return graph
