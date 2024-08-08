@@ -23,7 +23,7 @@ def check_graph_mapping(graph: Graph, graph_map: Dict) -> int:
     return count
 
 
-def compare_graphs(x: Graph, y: Graph, edges: bool = True) -> bool:
+def compare_graphs(x: Graph, y: Graph, edges: bool = False) -> bool:
     state = True
 
     x_len = len(x.nodes.nodes)
@@ -38,7 +38,7 @@ def compare_graphs(x: Graph, y: Graph, edges: bool = True) -> bool:
             else:
                 return False
     else:
-        state = False
+        return False
 
     if edges:
         state = compare_edges(x=x.edges, y=y.edges)

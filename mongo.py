@@ -53,25 +53,30 @@ class MongoHandler(BaseModel):
             print(f"Database connection test failed: {e}")
             return False
 
+
     def close_connection(self) -> None:
         if self.client:
             self.client.close()
             logging.info("MongoDB connection closed")
 
+
     async def count_documents(self, db_name: str, collection_name: str, filter: Dict = {}) -> int:
         collection =  self.get_collection(db_name=db_name, collection_name=collection_name)
         return await collection.count_documents(filter=filter)
+
 
     async def insert(self, entry: dict, db_name: str = 'data', collection_name: str = 'url_map') -> InsertOneResult:
         collection = self.get_collection(db_name=db_name, collection_name=collection_name)
         result = await collection.insert_one(entry)
 
         return result
-    
+
+
     async def insert_many(self, entries: List[dict], db_name: str = 'data', collection_name: str = 'url_map') -> InsertManyResult:
         collection = self.get_collection(db_name=db_name, collection_name=collection_name)
         result = await collection.insert_many(entries)
         return result
+
 
     async def get_document(self, db_name: str = 'data', collection_name: str = 'url_map', filter: Optional[Dict] = None, sort: Optional[list] = None) -> Optional[Dict]:
         collection = self.get_collection(db_name=db_name, collection_name=collection_name)
@@ -80,6 +85,7 @@ class MongoHandler(BaseModel):
             return await collection.find_one(filter=filter, sort=sort)
         return await collection.find_one(filter=filter)
     
+
     async def get_documents(self, db_name: str, collection_name: str, query: dict, length: int = None) -> AsyncGenerator[List[Dict[str, Any]], None]:
         collection = self.get_collection(db_name, collection_name)
         cursor = collection.find(query)
@@ -99,22 +105,30 @@ class MongoHandler(BaseModel):
     async def delete_document(self, db_name: str = 'data', collection_name: str = 'url_map', filter: Optional[Dict] = {}) -> DeleteResult:
         collection = self.get_collection(db_name=db_name, collection_name=collection_name)
         return await collection.delete_one(filter=filter)
-    
+
+
     async def delete_documents(self, db_name: str = 'data', collection_name: str = 'url_map', filter: Optional[Dict] = {}) -> DeleteResult:
         collection = self.get_collection(db_name=db_name, collection_name=collection_name)
         return await collection.delete_many(filter=filter)
 
+
     async def update_document(self, entry: Dict, db_name: str = 'data', collection_name: str = 'url_map', query: Optional[Dict] = None) -> UpdateResult:
         collection = self.get_collection(db_name=db_name, collection_name=collection_name)
         return await collection.update_one(query, {"$set": entry}, upsert=True)
-    
+
+
     async def document_exists(self, db_name: str = 'data', collection_name: str = 'url_map', filter: Optional[Dict] = None) -> int:
         collection = self.get_collection(db_name=db_name, collection_name=collection_name)
         return await collection.count_documents(filter=filter)
 
+
     def get_collection(self, db_name: str, collection_name: str):
         return self.client[db_name][collection_name]
     
+
+    async def create_document(self, **kwargs) -> Dict:
+        return {key:value for key, value in kwargs.items()}
+
 
     async def cleanup(self, db_name: str, collection_name: str) -> DeleteResult:
         return await self.delete_documents(db_name=db_name, collection_name=collection_name)

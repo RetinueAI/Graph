@@ -1,7 +1,6 @@
 from datetime import datetime, timezone, timedelta
 import os
 import json
-import gc
 import time
 import bson
 from bson import encode, ObjectId
@@ -269,8 +268,8 @@ class Graph(BaseModel):
     root: bool = Field(default=False)
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     user_id: str
-    nodes: Nodes = Field(default=None)
-    edges: Edges = Field(default_factory=Edges)
+    nodes: Nodes = Field(default_factory=Nodes)
+    edges: Optional['Edges'] = None
     parent: Optional['Graph'] = None
     depth: int = 0
 
@@ -317,22 +316,36 @@ class Graph(BaseModel):
 class GraphSync(BaseModel):
     user_id: str
     mongo_handler: MongoHandler
-    local_storage_path: str = Field(default=os.path.join(os.getcwd(),'graph'))
+    local_storage_path: str = None
     graph: Graph = Field(default=None)
     graph_map: Dict = Field(default={})
     last_sync_timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     max_batch_size: int = Field(default=48*1024*1024)
 
 
+    def model_post_init(self, context=None):
+        graph_dir = os.path.join(os.getcwd(), 'graph')
+        if 'graph' not in os.listdir(os.getcwd()):
+            os.makedirs(graph_dir, exist_ok=True)
+
+        if 'edges' not in os.listdir(graph_dir):
+            os.makedirs(os.path.join(graph_dir, 'edges'), exist_ok=True)
+
+        if 'nodes' not in os.listdir(graph_dir):
+            os.makedirs(os.path.join(graph_dir, 'nodes'), exist_ok=True)
+
+        if 'map' not in os.listdir(graph_dir):
+            os.makedirs(os.path.join(graph_dir, 'map'), exist_ok=True)
+
+        if 'changelogs' not in os.listdir(graph_dir):
+            os.makedirs(os.path.join(graph_dir, 'changelogs'), exist_ok=True)
+
+
     class Config:
         arbitrary_types_allowed = True
 
 
-    async def generate_node_map(self):
-        pass
-
-
-    async def _save_node_locally(self, node: Node):
+    async def save_node_locally(self, node: Node):
         nodes_storage_path = os.path.join(self.local_storage_path, 'nodes')
         node_storage_path = os.path.join(nodes_storage_path, node.parent)
         node_file_path = os.path.join(node_storage_path, f'{node.id}.bson')
@@ -346,7 +359,7 @@ class GraphSync(BaseModel):
             f.write(bson_data)
 
 
-    async def _save_edge_locally(self, edge: Edge):
+    async def save_edge_locally(self, edge: Edge):
         edges_storage_path = os.path.join(self.local_storage_path, 'edges')
         from_edge_path = '_'.join([str(id) for id in self.graph.edges.edge_map.get_path(edge.from_node)])
         edge_storage_path = os.path.join(edges_storage_path, from_edge_path)
@@ -375,7 +388,7 @@ class GraphSync(BaseModel):
         try:
             for node in nodes.nodes.values():
                 try:
-                    await self._save_node_locally(node)
+                    await self.save_node_locally(node)
                 except Exception as e:
                     print(e)
                     return False
@@ -457,7 +470,7 @@ class GraphSync(BaseModel):
     async def _save_edges_to_local(self, edges: Edges) -> bool:
         try:
             for edge in edges.edges.values():
-                await self._save_edge_locally(edge=edge)
+                await self.save_edge_locally(edge=edge)
         except Exception as e:
             print(e)
             return False
@@ -484,7 +497,6 @@ class GraphSync(BaseModel):
                 )
                 results.append(result)
                 pbar.update(len(batch))
-                gc.collect()
                 await asyncio.sleep(0)
 
         return results
@@ -502,19 +514,22 @@ class GraphSync(BaseModel):
         if batch:
             yield batch
 
+    async def _save_graph_map_to_database(self) -> Dict:
+        return self.mongo_handler.insert(
+            entry=self.graph_map,
+            db_name='Graph',
+            collection_name='Maps',
+        )
 
-    async def save_to_database(self) -> Tuple[List[InsertManyResult], List[InsertManyResult]]:
-        print("Saving to database.")
 
-        print(f"self.graph.id = {self.graph.id}")
-        node = next(iter(self.graph.nodes.nodes.values()))
-        print(f"node parent in self.graph = {node.parent}")
+    async def save_to_database(self) -> Tuple[List[InsertManyResult], List[InsertManyResult], InsertOneResult]:
+        print("Saving to database...")
 
         nodes_result = await self._save_nodes_to_database(nodes=self.graph.nodes)
-        # edges_result = await self._save_edges_to_database(edges=self.graph.edges)
+        edges_result = await self._save_edges_to_database(edges=self.graph.edges)
+        graph_map_result = await self._save_graph_map_to_database()
 
-        return (nodes_result, None)
-        # return (nodes_result, edges_result)
+        return (nodes_result, edges_result, graph_map_result)
 
 
     async def _load_node_from_database(self, node_id: int, node_name: str) -> Node:
@@ -624,7 +639,6 @@ class GraphSync(BaseModel):
                 edges.edge_map.id_to_path[edge_dict['t']] = to_tuple
                 edges.edge_map.path_to_id[to_tuple] = edge_dict['t']
                 i+=1
-            gc.collect()
                 
 
         print(f"Amount of edges loaded: {i}")
@@ -687,6 +701,7 @@ class GraphSync(BaseModel):
 
 
     async def load_graph_from_database(self):
+        self.graph_map = await self._load_graph_map_from_database()
         self.graph = await self._rebuild_graph(graph_id=self.graph_map['graph']['id'], root=True, local=False)
         self.graph.edges = await self._load_edges_from_database()
 

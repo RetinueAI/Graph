@@ -2,7 +2,7 @@ from typing import List, Dict, Tuple, Any
 import json
 import uuid
 
-from graph import Graph
+from graph import Graph, Edges
 
 
 
@@ -10,7 +10,7 @@ def generate_new_graph() -> Graph:
     with open('user_id.txt', 'r') as f:
         user_id = f.read()
 
-    graph = Graph(user_id=user_id)
+    graph = Graph(user_id=user_id, edges=Edges())
 
     with open('categories.json', 'r') as f:
         categories = json.load(f)
