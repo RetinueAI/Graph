@@ -94,8 +94,11 @@ class Node(BaseModel):
     
     @classmethod
     def from_dict(cls, data: Dict) -> 'Node':
-        node = cls(id=data['i'], name=data['n'], parent=data['p'])
-        node.data = bytearray.fromhex(data['d'].hex())
+        node = cls(
+            id=data['i'], 
+            name=data['n'], parent=data['p'],
+            data=bytearray.fromhex(data['d'].hex())
+        )
         if data['s']:
             node.subgraph = data['s']
         return node
@@ -113,23 +116,6 @@ class Nodes(BaseModel):
     
     class Config:
         arbitrary_types_allowed = True
-
-
-class EdgeMap:
-    def __init__(self):
-        self.path_to_id = {}
-        self.id_to_path = {}
-        self.counter = 0
-
-    def get_id(self, path: Tuple[int, ...]) -> int:
-        if path not in self.path_to_id:
-            self.counter += 1
-            self.path_to_id[path] = self.counter
-            self.id_to_path[self.counter] = path
-        return self.path_to_id[path]
-
-    def get_path(self, id: int) -> Tuple[int, ...]:
-        return self.id_to_path[id]
 
 
 class Edge(BaseModel):
@@ -178,9 +164,29 @@ class Edge(BaseModel):
 
     @classmethod
     def from_dict(cls, data: Dict) -> 'Edge':
-        edge = cls(data['f'], data['t'])
-        edge.data = bytearray.fromhex(data['d'].hex())
+        edge = cls(
+            from_node=data['f'], 
+            to_node=data['t'], 
+            data=bytearray.fromhex(data['d'].hex())
+        )
         return edge
+
+
+class EdgeMap:
+    def __init__(self):
+        self.path_to_id = {}
+        self.id_to_path = {}
+        self.counter = 0
+
+    def get_id(self, path: Tuple[int, ...]) -> int:
+        if path not in self.path_to_id:
+            self.counter += 1
+            self.path_to_id[path] = self.counter
+            self.id_to_path[self.counter] = path
+        return self.path_to_id[path]
+
+    def get_path(self, id: int) -> Tuple[int, ...]:
+        return self.id_to_path[id]
 
 
 class Edges(BaseModel):
@@ -263,7 +269,7 @@ class Graph(BaseModel):
     root: bool = Field(default=False)
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     user_id: str
-    nodes: Nodes = Field(default_factory=Nodes)
+    nodes: Nodes = Field(default=None)
     edges: Edges = Field(default_factory=Edges)
     parent: Optional['Graph'] = None
     depth: int = 0
@@ -327,18 +333,32 @@ class GraphSync(BaseModel):
 
 
     async def _save_node_locally(self, node: Node):
-        path = os.path.join(self.local_storage_path, 'nodes', f'{node.parent}_{str(node.id)}.bson')
+        nodes_storage_path = os.path.join(self.local_storage_path, 'nodes')
+        node_storage_path = os.path.join(nodes_storage_path, node.parent)
+        node_file_path = os.path.join(node_storage_path, f'{node.id}.bson')
+
+        if node.parent not in os.listdir(nodes_storage_path):
+            os.makedirs(node_storage_path, exist_ok=True)
+
         bson_data = bson.BSON.encode(node.to_dict())
 
-        with open(path, 'wb') as f:
+        with open(node_file_path, 'wb') as f:
             f.write(bson_data)
 
 
     async def _save_edge_locally(self, edge: Edge):
-        path = os.path.join(self.local_storage_path, 'edges', f'{str(edge.from_node)}_{edge.to_node}.bson')
+        edges_storage_path = os.path.join(self.local_storage_path, 'edges')
+        from_edge_path = '_'.join([str(id) for id in self.graph.edges.edge_map.get_path(edge.from_node)])
+        edge_storage_path = os.path.join(edges_storage_path, from_edge_path)
+        to_edge_path = '_'.join([str(id) for id in self.graph.edges.edge_map.get_path(edge.to_node)])
+        edge_file_path = os.path.join(edge_storage_path, f"{to_edge_path}.bson")
+
+        if from_edge_path not in os.listdir(edges_storage_path):
+            os.makedirs(edge_storage_path, exist_ok=True)
+
         bson_data = bson.BSON.encode(edge.to_dict())
 
-        with open(path, 'wb') as f:
+        with open(edge_file_path, 'wb') as f:
             f.write(bson_data)
 
 
@@ -435,7 +455,14 @@ class GraphSync(BaseModel):
 
 
     async def _save_edges_to_local(self, edges: Edges) -> bool:
-        pass
+        try:
+            for edge in edges.edges.values():
+                await self._save_edge_locally(edge=edge)
+        except Exception as e:
+            print(e)
+            return False
+
+        return True
 
 
     async def _save_edges_to_database(self, edges: Edges) -> List[InsertManyResult]:
@@ -502,7 +529,7 @@ class GraphSync(BaseModel):
         return None
         
 
-    async def load_edge_from_database(self, from_node: int, to_node: int) -> Edge:
+    async def _load_edge_from_database(self, from_node: int, to_node: int) -> Edge:
         edge_document = await self.mongo_handler.get_document(
             db_name='Graph',
             collection_name='Nodes',
@@ -517,24 +544,30 @@ class GraphSync(BaseModel):
         return None
 
 
-    async def _load_node_from_local(self, node_id: int, node_name: str) -> Node:
-        node_storage_path = os.path.join(self.local_storage_path, 'nodes')
-        filename = f"{str(node_id)}_{node_name}.bson"
+    async def _load_node_from_local(self, graph_id: str, node_id: int) -> Node:
+        node_storage_path = os.path.join(self.local_storage_path, 'nodes', graph_id)
+        filename = f"{node_id}.bson"
 
         if filename in os.listdir(node_storage_path):
             with open(os.path.join(node_storage_path, filename), 'rb') as f:
                 bson_data = f.read()
+        else:
+            print("Didn't find the node in localstorage...")
+            return None
 
         return Node.from_dict(bson.BSON(bson_data).decode())
     
 
     async def _load_edge_from_local(self, from_node: int, to_node: int) -> Edge:
-        node_storage_path = os.path.join(self.local_storage_path, 'nodes')
-        filename = f"{str(from_node)}_{to_node}.bson"
+        node_storage_path = os.path.join(self.local_storage_path, 'edges', f'{from_node}')
+        filename = f"{to_node}.bson"
 
         if filename in os.listdir(node_storage_path):
             with open(os.path.join(node_storage_path, filename), 'rb') as f:
                 bson_data = f.read()
+        else:
+            print("Didn't fine the edge in localstorage...")
+            return None
 
         return Edge.from_dict(bson.BSON(bson_data).decode())
 
@@ -562,6 +595,42 @@ class GraphSync(BaseModel):
         )
 
 
+    async def _load_edges_from_local(self) -> Edges:
+        edges = Edges()
+        edges_storage_path = os.path.join(self.local_storage_path, 'edges')
+        i = 0
+
+        for from_node in os.listdir(edges_storage_path):
+            edge_storage_path = os.path.join(edges_storage_path, from_node)
+
+            for edge_file in os.listdir(edge_storage_path):
+                with open(os.path.join(edge_storage_path, edge_file), 'rb') as f:
+                    bson_data = f.read()
+
+                edge_dict = bson.BSON(bson_data).decode()
+                edge = Edge.from_dict(edge_dict)
+                edges.edges[(edge_dict['f'], edge_dict['t'])] = edge
+
+                from_tuple = from_node.split('_')
+                from_tuple = tuple([int(id) for id in from_tuple])
+
+                to_tuple = edge_file.split('.')[0]
+                to_tuple = to_tuple.split('_')
+                to_tuple = tuple([int(id) for id in to_tuple])
+
+                edges.edge_map.id_to_path[edge_dict['f']] = from_tuple
+                edges.edge_map.path_to_id[from_tuple] = edge_dict['f']
+
+                edges.edge_map.id_to_path[edge_dict['t']] = to_tuple
+                edges.edge_map.path_to_id[to_tuple] = edge_dict['t']
+                i+=1
+            gc.collect()
+                
+
+        print(f"Amount of edges loaded: {i}")
+        return edges
+
+
     async def _load_edges_from_database(self) -> Edges:
         edges = Edges()
         batch_size = 1000
@@ -571,13 +640,10 @@ class GraphSync(BaseModel):
         with tqdm(total=total_edges, desc="Loading edges") as pbar:
             async for edge_batch in self._load_edges_in_batches(batch_size=batch_size):
                 for edge_doc in edge_batch:
-                    from_node = edge_doc['from_node']
-                    to_node = edge_doc['to_node']
                     edge = Edge.from_dict(edge_doc['edge'])
-                    edges.edges[(from_node, to_node)] = edge
+                    edges.edges[(edge_doc['f'], edge_doc['t'])] = edge
                 
                 pbar.update(len(edge_batch))
-                gc.collect()
                 await asyncio.sleep(0)
         
         return edges
@@ -614,29 +680,44 @@ class GraphSync(BaseModel):
         self.graph_map = result['map']
 
 
-    async def load_from_database(self):
-        print("Loading from database")
-
-        nodes = await self._load_nodes_from_database()
-        edges = await self._load_edges_from_database()
-
-        print(f"Number of nodes loaded: {len(nodes.nodes)}")
-        print(f"Number of edges loaded: {len(edges.edges)}")
-
+    async def load_graph_from_local(self):
+        self.graph = await self._rebuild_graph(graph_id=self.graph_map['graph']['id'], root=True)
+        self.graph.edges = await self._load_edges_from_local()
+        print(f"self.graph.edges: {len(self.graph.edges.edges)}")
 
 
     async def load_graph_from_database(self):
-        self.graph = await self._rebuild_graph(graph_id=self.graph_map['graph']['id'], root=True)
-        # self.graph.edges = await self._load_edges_from_database()
+        self.graph = await self._rebuild_graph(graph_id=self.graph_map['graph']['id'], root=True, local=False)
+        self.graph.edges = await self._load_edges_from_database()
 
 
-    async def _add_subgraphs(self, graph: Graph) -> None:
+    async def _add_subgraphs(self, graph: Graph, local: bool = True) -> None:
         for node in graph.nodes.nodes.values():
             if node.subgraph:
-                node.subgraph = await self._rebuild_graph(graph_id=node.subgraph)
+                node.subgraph = await self._rebuild_graph(graph_id=node.subgraph, local=local)
 
 
-    async def fetch_graph_nodes(self, graph_id: str):
+    async def _fetch_graph_nodes_from_local(self, graph_id: str) -> List[Dict]:
+        nodes_storage_path = os.path.join(self.local_storage_path, 'nodes')
+        node_storage_path = os.path.join(nodes_storage_path, graph_id)
+        graph_nodes = []
+
+        if graph_id in os.listdir(nodes_storage_path):
+            for node in os.listdir(node_storage_path):
+
+                
+                with open(os.path.join(node_storage_path, node), 'rb') as f:
+                    bson_data = f.read()
+
+                graph_node = bson.BSON(bson_data).decode()
+                graph_nodes.append(graph_node)
+        else:
+            print(f"Nodes for graph id {graph_id} doesn't exist...")
+
+        return graph_nodes
+
+
+    async def _fetch_graph_nodes_from_database(self, graph_id: str) -> List[Dict]:
         batched_nodes = self.mongo_handler.get_documents(
             db_name='Graph',
             collection_name='Nodes',
@@ -652,7 +733,7 @@ class GraphSync(BaseModel):
         return graph_nodes
 
 
-    async def _rebuild_graph(self, graph_id: str, root: bool = False) -> Graph:
+    async def _rebuild_graph(self, graph_id: str, root: bool = False, local: bool = True) -> Graph:
 
         graph = Graph(
             id=graph_id,
@@ -660,7 +741,10 @@ class GraphSync(BaseModel):
             root=root,
         )
 
-        graph_nodes = await self.fetch_graph_nodes(graph_id=graph_id)
+        if local:
+            graph_nodes = await self._fetch_graph_nodes_from_local(graph_id=graph_id)
+        else:
+            graph_nodes = await self._fetch_graph_nodes_from_database(graph_id=graph_id)
 
         nodes_nodes = {}
         node_map = {}
@@ -677,6 +761,6 @@ class GraphSync(BaseModel):
 
         graph.nodes = nodes
 
-        await self._add_subgraphs(graph=graph)
+        await self._add_subgraphs(graph=graph, local=local)
 
         return graph
