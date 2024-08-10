@@ -3,32 +3,22 @@ from typing import Dict, Optional, Any, List, AsyncGenerator
 from pathlib import Path
 import logging
 
-from pydantic import BaseModel, model_validator
+from pydantic.dataclasses import dataclass
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorCursor
 from pymongo.server_api import ServerApi
 from pymongo.results import InsertOneResult, InsertManyResult, DeleteResult, UpdateResult
 
 
 
-class MongoHandler(BaseModel):
-    client: Optional[AsyncIOMotorClient] = None
-    uri: str
-    cert_path: str
+class MongoHandler:
+    def __init__(self, uri: str, cert_path: str) -> None:
+        self.client: AsyncIOMotorClient = self._init_client(
+            uri=uri,
+            cert_path=cert_path,
+        )
 
-    class Config:
-        arbitrary_types_allowed = True
 
-    @model_validator(mode='before')
-    def init_mongo(cls, values: Dict[str, Any]) -> Dict[str, Any]:
-        uri = values.get('uri')
-        cert_path = values.get('cert_path')
-
-        if not uri:
-            raise ValueError('MongoDB URI not provided.')
-        
-        if not cert_path:
-            raise ValueError('MongoDB Certificate Path not provided.')
-
+    def _init_client(self, uri: str, cert_path: str):
         try:
             client = AsyncIOMotorClient(
                 uri,
@@ -39,18 +29,16 @@ class MongoHandler(BaseModel):
         except Exception as e:
             logging.error(f"Failed to connect to MongoDB: {e}")
             raise ValueError('Could not connect to MongoDB')
+        
+        return client
 
-        values['client'] = client
 
-        return values
-    
     async def test_database_connection(self):
         try:
-            # Attempt to perform a simple operation
             await self.client.admin.command('ping')
             return True
         except Exception as e:
-            print(f"Database connection test failed: {e}")
+            logging.error(f"Database connection test failed: {e}")
             return False
 
 
@@ -98,7 +86,6 @@ class MongoHandler(BaseModel):
 
             yield documents
             
-            
         await cursor.close()
 
 
@@ -124,7 +111,7 @@ class MongoHandler(BaseModel):
 
     def get_collection(self, db_name: str, collection_name: str):
         return self.client[db_name][collection_name]
-    
+
 
     async def create_document(self, **kwargs) -> Dict:
         return {key:value for key, value in kwargs.items()}

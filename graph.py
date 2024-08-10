@@ -5,13 +5,14 @@ import time
 import bson
 from bson import encode, ObjectId
 from bson.json_util import dumps, loads
-from typing import Dict, Optional, List, Tuple, Any, Union, Generator, AsyncGenerator
+from typing import Dict, Optional, List, Tuple, Any, Union, Generator, AsyncGenerator, Callable
 import uuid
 import random
 import asyncio
 import bson.json_util
 import psutil
 import struct
+import logging
 
 from tqdm import tqdm
 from dateutil import parser
@@ -27,62 +28,92 @@ from mongo import MongoHandler
     
 
 
-class Node(BaseModel):
-    id: int
-    name: str
-    parent: str
-    data: bytearray = Field(default=bytearray(10))
-    subgraph: Optional[Union['Graph',str]] = None
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-    class Config:
-        arbitrary_types_allowed = True
 
-    def update_engagement(self) -> None:
-        self.set_interest_frequency()
-        self.set_last_engagement()
-
-    def update_engagement_score(self):
-        recency = (datetime.now(timezone.utc) - self.get_last_engagement()).total_seconds()
-        self.engagement_score = (self.get_interest_frequency() * self.get_eigenvector_centrality()) / (recency + 1)
-
-    def set_interest_frequency(self) -> None:
-        new_value = 1 + self.get_interest_frequency()
-        struct.pack_into('H', self.data, 0, new_value)
-
-    def get_interest_frequency(self) -> int:
-        return struct.unpack_from('H', self.data, 0)[0]
-
-    def set_eigenvector_centrality(self, value: float) -> None:
-        struct.pack_into('H', self.data, 2, int(value * 65535))
-
-    def get_eigenvector_centrality(self) -> float:
-        return struct.unpack_from('H', self.data, 2)[0] / 65535.0
-    
-    def set_engagement_score(self, value: float) -> None:
-        struct.pack_into('H', self.data, 4, int(value * 65535))
-
-    def get_engagement_score(self) -> float:
-        return struct.unpack_from('H', self.data, 4)[0] / 65535.0
-    
-    def set_last_engagement(self) -> None:
-        value = int(datetime.now(timezone.utc).timestamp())
-        struct.pack_into('I', self.data, 6, value)
-
-    def get_last_engagement(self) -> datetime:
-        return datetime.fromtimestamp(struct.unpack_from('I', self.data, 6)[0])
-    
-    def set_subgraph(self, subgraph: 'Graph') -> None:
+class Node:
+    def __init__(
+        self, 
+        id: int, 
+        name: str, 
+        parent: str, 
+        data: bytearray = None,
+        subgraph: Optional[Union['Graph',str]] = None,
+    ):
+        self.id = id
+        self.name = name
+        self.parent = parent
+        self.data = data if data else bytearray(16)
         self.subgraph = subgraph
 
-    def to_feature_vector(self):
+
+    async def update_engagement(self) -> None:
+        await self.set_interest_frequency()
+        await self.set_last_engagement()
+        await self.update_engagement_score()
+
+
+    async def update_engagement_score(self):
+        recency = (datetime.now(timezone.utc) - await self.get_last_engagement()).total_seconds()
+        value = (await self.get_interest_frequency() * await self.get_eigenvector_centrality()) / (recency + 1)
+        await self.set_engagement_score(value=value)
+
+
+    async def set_interest_frequency(self, value: int = None) -> None:
+        if not value:
+            old_value = await self.get_interest_frequency()
+            value = 1 + old_value
+
+        value = min(4294967295, 1 + value)
+
+        struct.pack_into('I', self.data, 0, value)
+
+
+    async def get_interest_frequency(self) -> int:
+        return struct.unpack_from('I', self.data, 0)[0]
+
+
+    async def set_eigenvector_centrality(self, value: float) -> None:
+        struct.pack_into('I', self.data, 4, int(value * 4294967295))
+
+
+    async def get_eigenvector_centrality(self) -> float:
+        return struct.unpack_from('I', self.data, 4)[0] / 4294967295.0
+
+
+    async def set_engagement_score(self, value: float) -> None:
+        struct.pack_into('I', self.data, 8, int(value * 4294967295))
+
+
+    async def get_engagement_score(self) -> float:
+        return struct.unpack_from('I', self.data, 8)[0] / 4294967295.0
+
+
+    async def set_last_engagement(self) -> None:
+        value = int(datetime.now(timezone.utc).timestamp())
+        struct.pack_into('I', self.data, 12, value)
+
+
+    async def get_last_engagement(self) -> datetime:
+        timestamp = struct.unpack_from('I', self.data, 12)[0]
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+
+
+    async def set_subgraph(self, subgraph: 'Graph') -> None:
+        self.subgraph = subgraph
+
+
+    async def to_feature_vector(self):
         return [
-            self.get_interest_frequency(),
-            self.get_eigenvector_centrality(),
-            self.get_engagement_score(),
-            (datetime.now(timezone.utc) - self.get_last_engagement()).total_seconds()
+            await self.get_interest_frequency(),
+            await self.get_eigenvector_centrality(),
+            await self.get_engagement_score(),
+            (datetime.now(timezone.utc) - await self.get_last_engagement()).total_seconds()
         ]
 
-    def to_dict(self) -> Dict:
+
+    async def to_dict(self) -> Dict:
         return {
             'i': self.id,
             'n': self.name,
@@ -91,6 +122,7 @@ class Node(BaseModel):
             's': self.subgraph.id if self.subgraph else None
         }
     
+
     @classmethod
     def from_dict(cls, data: Dict) -> 'Node':
         node = cls(
@@ -103,58 +135,78 @@ class Node(BaseModel):
         return node
 
 
-class Nodes(BaseModel):
-    nodes: Dict[int, Node] = Field(default={})
-    node_map: Dict[str, int] = Field(default={})
-
-    def get_node(self, node: int) -> Node:
-        return self.nodes[node]
-
-    def get_node_id(self, node: str) -> int:
-        return self.node_map[node]
-    
-    class Config:
-        arbitrary_types_allowed = True
+class Nodes:
+    def __init__(
+        self,
+        nodes: Dict[int,Node] = None,
+        node_map: Dict[str,int] = None,
+    ):
+        self.nodes = nodes if nodes else {}
+        self.node_map = node_map if node_map else {}
 
 
-class Edge(BaseModel):
-    from_node: int
-    to_node: int
-    data: bytearray = Field(default=bytearray(10))
+    async def add_node(self, id: int, name: str, parent: str)-> None:
+        logger.debug(f"Creating node {id}: {name} with parent {parent}")
+        node = Node(id=id, name=name, parent=parent)
+        self.nodes[id] = node
+        self.node_map[name] = id
+        logger.debug(f"Node {id}: {name} added. Total nodes: {len(self.nodes)}")
 
-    class Config:
-        arbitrary_types_allowed = True
 
-    def update_interaction(self):
-        strength = min(65535, self.get_interaction_strength() + 1)
-        self.set_interaction_strength(strength)
-        self.set_last_interaction(int(datetime.now(timezone.utc).timestamp()))
+    async def remove_node(self, node_id: int) -> None:
+        pass
 
-    def get_interaction_strength(self) -> int:
+    async def get_node(self, node_id: int) -> Node:
+        return self.nodes[node_id]
+
+    async def get_node_id(self, node_name: str) -> int:
+        return self.node_map[node_name]
+
+
+class Edge:
+    def __init__(
+            self,
+            from_node: int,
+            to_node: int,
+            data: bytearray = None,        
+    ):
+        self.from_node = from_node
+        self.to_node = to_node
+        self.data = data if data else bytearray(10)
+
+
+    async def update_interaction(self):
+        strength = min(65535, await self.get_interaction_strength() + 1)
+        await self.set_interaction_strength(strength)
+        await self.set_last_interaction(int(datetime.now(timezone.utc).timestamp()))
+
+    async def get_interaction_strength(self) -> int:
         return struct.unpack_from('H', self.data, 0)[0]
 
-    def set_interaction_strength(self, value: int):
+    async def set_interaction_strength(self, value: int = None):
+        if not value:
+            value = 1 + await self.get_interaction_strength()
         struct.pack_into('H', self.data, 0, value)
 
-    def get_last_interaction(self) -> int:
+    async def get_last_interaction(self) -> int:
         return struct.unpack_from('I', self.data, 2)[0]
 
-    def set_last_interaction(self, value: int):
+    async def set_last_interaction(self, value: int):
         struct.pack_into('I', self.data, 2, value)
 
-    def get_contextual_similarity(self) -> float:
+    async def get_contextual_similarity(self) -> float:
         return struct.unpack_from('H', self.data, 6)[0] / 65535.0
 
-    def set_contextual_similarity(self, value: float):
+    async def set_contextual_similarity(self, value: float):
         struct.pack_into('H', self.data, 6, int(value * 65535))
 
-    def get_sequential_relation(self) -> float:
+    async def get_sequential_relation(self) -> float:
         return struct.unpack_from('H', self.data, 8)[0] / 65535.0
 
-    def set_sequential_relation(self, value: float):
+    async def set_sequential_relation(self, value: float):
         struct.pack_into('H', self.data, 8, int(value * 65535))
 
-    def to_dict(self) -> Dict:
+    async def to_dict(self) -> Dict:
         return {
             "f": self.from_node,
             "t": self.to_node,
@@ -172,66 +224,64 @@ class Edge(BaseModel):
 
 
 class EdgeMap:
-    def __init__(self):
-        self.path_to_id = {}
-        self.id_to_path = {}
-        self.counter = 0
+    def __init__(
+            self, 
+            path_to_id: dict = None, 
+            id_to_path: dict = None,
+            counter: int = None
+    ):
+        self.path_to_id = path_to_id if path_to_id else {}
+        self.id_to_path = id_to_path if id_to_path else {}
+        self.counter = counter if counter else 0
 
-    def get_id(self, path: Tuple[int, ...]) -> int:
+    async def get_id(self, path: Tuple[int, ...]) -> int:
         if path not in self.path_to_id:
             self.counter += 1
             self.path_to_id[path] = self.counter
             self.id_to_path[self.counter] = path
         return self.path_to_id[path]
 
-    def get_path(self, id: int) -> Tuple[int, ...]:
+    async def get_path(self, id: int) -> Tuple[int, ...]:
         return self.id_to_path[id]
 
 
-class Edges(BaseModel):
-    edges: Dict[Tuple[int, int], Edge] = Field(default={})
-    edge_map: EdgeMap = Field(default=EdgeMap())
+class Edges:
+    def __init__(
+            self,
+            edges: Dict[Tuple[int, int], Edge] = None,
+            edge_map: EdgeMap = None,
+    ):
+        self.edges = edges if edges else {}
+        self.edge_map = edge_map if edge_map else EdgeMap()
 
-    class Config:
-        arbitrary_types_allowed = True
 
-    def get_edge(self, from_: Tuple[int, ...], to_: Tuple[int, ...]) -> Edge:
-        from_id = self.edge_map.get_id(from_)
-        to_id = self.edge_map.get_id(to_)
+    async def get_edge(self, from_: Tuple[int, ...], to_: Tuple[int, ...]) -> Edge:
+        from_id = await self.edge_map.get_id(from_)
+        to_id = await self.edge_map.get_id(to_)
         return self.edges[(from_id, to_id)]
 
-    def add_edge(self, from_: Tuple[int, ...], to_: Tuple[int, ...]) -> None:
-        from_id = self.edge_map.get_id(from_)
-        to_id = self.edge_map.get_id(to_)
+
+    async def add_edge(self, from_: Tuple[int, ...], to_: Tuple[int, ...]) -> None:
+        from_id = await self.edge_map.get_id(from_)
+        to_id = await self.edge_map.get_id(to_)
         if (from_id, to_id) in self.edges:
             raise ValueError("Edge already exists")
         edge = Edge(from_node=from_id, to_node=to_id)
         self.edges[(from_id, to_id)] = edge
 
-    def to_dict(self):
-        return {
-            "edges": {f"{k[0]},{k[1]}": v.to_dict() for k, v in self.edges.items()},
-            "mapping": {str(k): v for k, v in self.edge_map.id_to_path.items()}
-        }
 
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]):
-        edges = cls()
-        for key, value in data["edges"].items():
-            from_id, to_id = map(int, key.split(','))
-            edges.edges[(from_id, to_id)] = Edge.from_dict(value)
-        edges.edge_map.id_to_path = {int(k): tuple(v) for k, v in data["mapping"].items()}
-        edges.edge_map.path_to_id = {v: k for k, v in edges.edge_map.id_to_path.items()}
-        edges.edge_map.counter = max(edges.edge_map.id_to_path.keys(), default=0)
-        return edges
+    async def remove_edge(self, from_: Tuple[int, ...], to_: Tuple[int, ...]) -> None:
+        pass
 
-    def generate_edge_key(self, from_: List[str], to_: List[str], root_graph: 'Graph') -> Tuple[int, ...]:
-        from_path = self.convert_str_list(from_, root_graph)
-        to_path = self.convert_str_list(to_, root_graph)
-        return (self.edge_map.get_id(from_path), self.edge_map.get_id(to_path))
 
-    def add_edge_from_str(self, from_: List[str], to_: List[str], root_graph: 'Graph') -> None:
-        edge_key = self.generate_edge_key(from_, to_, root_graph)
+    async def generate_edge_key(self, from_: List[str], to_: List[str], root_graph: 'Graph') -> Tuple[int, ...]:
+        from_path = await self.convert_str_list(from_, root_graph)
+        to_path = await self.convert_str_list(to_, root_graph)
+        return (await self.edge_map.get_id(from_path), await self.edge_map.get_id(to_path))
+
+
+    async def add_edge_from_str(self, from_: List[str], to_: List[str], root_graph: 'Graph') -> None:
+        edge_key = await self.generate_edge_key(from_, to_, root_graph)
         
         if edge_key in self.edges:
             raise ValueError("Edge already exists")
@@ -239,10 +289,10 @@ class Edges(BaseModel):
         edge = Edge(from_node=edge_key[0], to_node=edge_key[1])
         self.edges[edge_key] = edge
 
-    def convert_str_list(self, str_list: List[str], graph: 'Graph') -> Tuple[int]:
+
+    async def convert_str_list(self, str_list: List[str], graph: 'Graph') -> Tuple[int]:
         if len(str_list) < 1:
             return []
-        
         int_list = []
 
         int_list.append(graph.nodes.node_map[str_list[0]])
@@ -251,102 +301,296 @@ class Edges(BaseModel):
             raise ValueError(f"Node {str_list[0]} doesn't exist in graph {graph.id}.")
 
         if len(str_list) > 1:
-            subgraph = graph.nodes.nodes[int_list[0]].subgraph
+            node = await graph.get_node(int_list[0])
+            subgraph = node.subgraph
 
             if subgraph is None:
                 raise ValueError(f"The subgraph in node {int_list[0]} doesn't exist in graph {graph.id}")
             
             int_list.extend(
-                self.convert_str_list(str_list[1:], subgraph)
+                await self.convert_str_list(str_list[1:], subgraph)
             )
 
         return tuple(int_list)
 
 
-class Graph(BaseModel):
-    version: int = 1
-    root: bool = Field(default=False)
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    user_id: str
-    nodes: Nodes = Field(default_factory=Nodes)
-    edges: Optional['Edges'] = None
-    parent: Optional['Graph'] = None
-    depth: int = 0
+class Graph:
+    def __init__(
+            self,
+            user_id: str,
+            version: int = 1,
+            root: bool = False,
+            id: str = None,
+            nodes: Nodes = None,
+            edges: Optional[Edges] = None,
+            parent: Optional['Graph'] = None,
+            depth: int = None
+    ):
+        self.user_id = user_id
+        self.version = version
+        self.root = root
+        self.id = id if id else str(uuid.uuid4())
+        self.edges = edges if edges else Edges()
+        self.parent = parent
+        self.depth = depth if depth else 0
+        self.nodes = nodes if nodes else Nodes()
 
-    class Config:
-        arbitrary_types_allowed = True
 
-    def add_node(self, id: int, name: str) -> Node:
-        node = Node(id=id, name=name, parent=self.id)
-        self.nodes.nodes[id] = node
-        self.nodes.node_map[name] = id
-        return node
+    async def add_node(self, id: int, name: str) -> None:
+        logger.debug(f"Adding node {id}: {name} to graph {self.id}")
+        await self.nodes.add_node(id=id, name=name, parent=self.id)
+        logger.debug(f"Graph {self.id} now has {len(self.nodes.nodes)} nodes")
+        
 
-    def get_edge(self, _from: Tuple[int, ...], _to: Tuple[int, ...]) -> Edge:
-        return self.edges.get_edge((_from, _to))
+    async def add_edge(self, from_: Tuple[int, ...], to_: Tuple[int, ...]) -> None:
+        await self.edges.add_edge(from_=from_, to_=to_)
 
-    def get_node(self, node_id: int) -> Node:
-        return self.nodes.get_node(node_id)
 
-    def remove_edge(self, _from: Tuple[int, ...], _to: Tuple[int, ...]):
-        self.edges.edges.pop((_from, _to), None)
+    async def get_node(self, node_id: int) -> Node:
+        return await self.nodes.get_node(node_id=node_id)
+    
 
-    def remove_node(self, node_id: int):
-        self.nodes.nodes.pop(node_id, None)
+    async def get_edge(self, from_: Tuple[int, ...], to_: Tuple[int, ...]) -> Edge:
+        return await self.edges.get_edge(from_, to_)
+
+
+    async def remove_edge(self, from_: Tuple[int, ...], to_: Tuple[int, ...]) -> None:
+        await self.edges.remove_edge(from_=from_, to_=to_)
+
+
+    async def remove_node(self, node_id: int):
+        await self.nodes.remove_node(node_id=node_id)
         self.edges = {k: v for k, v in self.edges.edges.items() if node_id not in k}
 
-    def update_node_engagement(self, node_id: int):
-        if node_id in self.nodes.nodes:
-            self.nodes.nodes[node_id].update_engagement()
 
-    def update_edge_interaction(self, _from: Tuple[int, ...], _to: Tuple[int, ...]):
+    async def update_node_engagement(self, node_id: int):
+        if node_id in self.nodes.nodes:
+            await self.nodes.nodes[node_id].update_engagement()
+
+
+    async def update_edge_interaction(self, _from: Tuple[int, ...], _to: Tuple[int, ...]):
         edge_key = (_from, _to)
         if edge_key in self.edges.edges:
-            self.edges.edges[edge_key].update_interaction()
+            await self.edges.edges[edge_key].update_interaction()
 
 
-    def set_node_subgraph(self, node_id: int, subgraph: 'Graph'):
-        if node_id in self.nodes.nodes:
-
-            subgraph.parent = self
-            subgraph.depth = self.depth + 1
-            self.nodes.nodes[node_id].set_subgraph(subgraph)
-
-
-class GraphSync(BaseModel):
-    user_id: str
-    mongo_handler: MongoHandler
-    local_storage_path: str = None
-    graph: Graph = Field(default=None)
-    graph_map: Dict = Field(default={})
-    last_sync_timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    max_batch_size: int = Field(default=48*1024*1024)
+    async def set_node_subgraph(self, node_id: int, subgraph: 'Graph'):
+        logger.debug(f"Setting subgraph {subgraph.id} for node {node_id} in graph {self.id}")
+        node = await self.get_node(node_id=node_id)
+        subgraph.parent = self
+        # subgraph.depth = self.depth + 1
+        node.subgraph = subgraph
+        logger.debug(f"Subgraph set for node {node_id} in graph {self.id}")
 
 
-    def model_post_init(self, context=None):
+    async def get_highest_interest_node(self):
+        pass
+
+
+    async def get_highest_interest_node_chain(self) -> Optional[List[str]]:
+
+        async def get_node(nodes: Nodes) -> List[str]:
+            categories = []
+
+            score = -1
+            best_node = None
+
+            for node in nodes.nodes.values():
+                interes_frequency = await node.get_interest_frequency()
+                if interes_frequency > score:
+                    score = interes_frequency
+                    best_node = node
+            
+            categories.append(best_node.name)
+            logger.debug(f"{best_node.name} has {await best_node.get_interest_frequency()} interactions")
+
+            if best_node and best_node.subgraph:
+                categories.extend(await get_node(nodes=best_node.subgraph.nodes))
+
+            return categories
+
+        return await get_node(nodes=self.nodes)
+
+
+    async def get_highest_interest_node_at_depth(self, depth: int = 0) -> Optional[str]:
+        """
+        Returns the name of the node at the specified depth with the highest interest frequency.
+        If no nodes exist at that depth, return None.
+        """
+        if depth < 0:
+            return None
+
+        # Traverse nodes at the specified depth
+        highest_frequency = -1
+        highest_node_name = None
+
+        async def traverse(node: Node, current_depth: int):
+            nonlocal highest_frequency, highest_node_name
+
+            if current_depth == depth:
+                interest_frequency = await node.get_interest_frequency()
+                if interest_frequency > highest_frequency:
+                    highest_frequency = interest_frequency
+                    highest_node_name = node.name
+            elif current_depth < depth and node.subgraph:
+                for sub_node in node.subgraph.nodes.nodes.values():
+                    await traverse(sub_node, current_depth + 1)
+
+        # Start traversal from the root nodes
+        for node in self.nodes.nodes.values():
+            await traverse(node, 0)
+
+        return highest_node_name
+    
+
+    async def get_best_edge(self) -> Edge:
+        the_best = -1
+        the_edgest = None
+
+        for edge in self.edges.edges.values():
+            interaction_strength = await edge.get_interaction_strength()
+            if  interaction_strength > the_best:
+                the_best =  interaction_strength
+                the_edgest = edge
+
+        return the_edgest
+
+
+class GraphChanges:
+    def __init__(
+        self,
+        change_cache: List[Dict[str,Any]] = None,
+    ):
+        self.change_cache = change_cache if change_cache else {}
+        self.change_types = self._init_change_types()
+
+
+    def _init_change_types(self) -> Dict[str,Dict]:
+        return {
+            'node': ['add', 'update', 'remove', 'add_subgraph', 'update_subgraph', 'remove_subgraph'],
+            'edge': ['add', 'update', 'remove'],
+            'graph_map': ['update'],
+        }
+
+
+    async def node_change(self, change_type: str, node_id: int, node_name: str, parent_id: str, changes: Dict[str,Any]):
+        if change_type not in self.change_types['node']:
+            logging.error("The node change type doesn't exist...")
+            return
+
+        self.change_cache.append(
+            {
+                'type': change_type,
+                'node_id': node_id,
+                'node_name': node_name,
+                'parent_id': parent_id,
+                'changes': changes
+            }
+        )
+
+
+    async def edge_change(self, change_type: str, from_node: Tuple[int, ...], to_node: Tuple[int, ...], changes: Dict[str,Any]):
+        if change_type not in self.change_types['edge']:
+            print("The edge change type doesn't exist...")
+            return
+        
+        self.change_cache.append(
+            {
+                'type': change_type,
+                'from_node': from_node,
+                'to_node': to_node,
+                'changes': changes,
+            }
+        )
+
+    
+    async def graph_map_change(self, change_type: str, version: int, changes: Dict[str,Any]):
+        if change_type not in self.change_types['graph_map']:
+            print("The map change type doesn't exist...")
+            return
+        
+        self.change_cache.append(
+            {
+                'type': change_type,
+                'version': version,
+                'changes': changes,
+            }
+        )
+
+
+class GraphSync:
+    def __init__(
+            self,
+            user_id: str,
+            mongo_handler: MongoHandler,
+            graph_changes: GraphChanges = None,
+            graph: Graph = None,
+            graph_map: Dict = None,
+            sync_timestamp: datetime = None,
+            max_batch_size: int = 48*1024*1024,
+    ):
+        self.user_id = user_id
+        self.mongo_handler = mongo_handler
+        self.graph_changes = graph_changes if graph_changes else GraphChanges()
+        self.graph = graph
+        self.graph_map = graph_map if graph_map else {}
+        self.sync_timestamp = sync_timestamp
+        self.max_batch_size = max_batch_size
+        self.local_storage_paths = self._init_local_storage()
+        self.change_cache = []
+
+
+    def _init_local_storage(self) -> Dict[str,str]:
         graph_dir = os.path.join(os.getcwd(), 'graph')
+
+        self.local_storage_paths = {
+            'edges': os.path.join(graph_dir, 'edges'),
+            'nodes': os.path.join(graph_dir, 'nodes'),
+            'map': os.path.join(graph_dir, 'map'),
+            'changelogs': os.path.join(graph_dir, 'changelogs'),
+        }
+
         if 'graph' not in os.listdir(os.getcwd()):
             os.makedirs(graph_dir, exist_ok=True)
 
         if 'edges' not in os.listdir(graph_dir):
-            os.makedirs(os.path.join(graph_dir, 'edges'), exist_ok=True)
+            os.makedirs(self.local_storage_paths['edges'], exist_ok=True)
 
         if 'nodes' not in os.listdir(graph_dir):
-            os.makedirs(os.path.join(graph_dir, 'nodes'), exist_ok=True)
+            os.makedirs(self.local_storage_paths['nodes'], exist_ok=True)
 
         if 'map' not in os.listdir(graph_dir):
-            os.makedirs(os.path.join(graph_dir, 'map'), exist_ok=True)
+            os.makedirs(self.local_storage_paths['map'], exist_ok=True)
 
         if 'changelogs' not in os.listdir(graph_dir):
-            os.makedirs(os.path.join(graph_dir, 'changelogs'), exist_ok=True)
+            os.makedirs(self.local_storage_paths['changelogs'], exist_ok=True)
 
 
-    class Config:
-        arbitrary_types_allowed = True
+    async def sync(self):
+        # TODO Either update from database if it has the most current, or upload to database if local is most current
+        # TODO update sync timestamp with: datetime.now(timezone.utc)
+        pass
+
+
+    async def _cache_change(self, change: Dict[str,Any]) -> None:
+        self.change_cache.append(change)
+
+
+    async def _save_changelog(self, changes: List[Dict]):
+        timestamp = datetime.now(timezone.utc)
+
+        changelog = {
+            'timestamp': timestamp,
+            'user_id': self.user_id,
+            'changes': changes
+        }
+
+        with open(os.path.join(self.local_storage_paths['changelogs'], f"{timestamp}.json"), 'w') as f:
+            json.dump(changelog, f)
 
 
     async def save_node_locally(self, node: Node):
-        nodes_storage_path = os.path.join(self.local_storage_path, 'nodes')
+        nodes_storage_path = os.path.join(self.local_storage_paths, 'nodes')
         node_storage_path = os.path.join(nodes_storage_path, node.parent)
         node_file_path = os.path.join(node_storage_path, f'{node.id}.bson')
 
@@ -360,7 +604,7 @@ class GraphSync(BaseModel):
 
 
     async def save_edge_locally(self, edge: Edge):
-        edges_storage_path = os.path.join(self.local_storage_path, 'edges')
+        edges_storage_path = os.path.join(self.local_storage_paths, 'edges')
         from_edge_path = '_'.join([str(id) for id in self.graph.edges.edge_map.get_path(edge.from_node)])
         edge_storage_path = os.path.join(edges_storage_path, from_edge_path)
         to_edge_path = '_'.join([str(id) for id in self.graph.edges.edge_map.get_path(edge.to_node)])
@@ -442,7 +686,6 @@ class GraphSync(BaseModel):
         batch = []          
 
         for node in nodes.nodes.values():
-            print(node.parent)
             all_nodes.extend(await self.collect(node=node))
 
         for node in all_nodes:
@@ -640,8 +883,6 @@ class GraphSync(BaseModel):
                 edges.edge_map.path_to_id[to_tuple] = edge_dict['t']
                 i+=1
                 
-
-        print(f"Amount of edges loaded: {i}")
         return edges
 
 
@@ -697,7 +938,6 @@ class GraphSync(BaseModel):
     async def load_graph_from_local(self):
         self.graph = await self._rebuild_graph(graph_id=self.graph_map['graph']['id'], root=True)
         self.graph.edges = await self._load_edges_from_local()
-        print(f"self.graph.edges: {len(self.graph.edges.edges)}")
 
 
     async def load_graph_from_database(self):

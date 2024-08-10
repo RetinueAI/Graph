@@ -14,7 +14,7 @@ def graph_interaction_update(graph: Graph, result: List[str]):
     category = result[0].replace('\n','')
     for node in graph.nodes.nodes.values():
         if node.name == category:
-            node.interest_frequency += 1
+            node.set_interest_frequency()
 
             if len(result) > 1:
                 graph_interaction_update(graph=node.subgraph, result=result[1:])

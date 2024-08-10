@@ -2,10 +2,10 @@ import os
 from time import time
 import json
 import asyncio
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List
 
-from graph import Graph, GraphSync, Edges
-from graph_generation import generate_graph, load_graph_map, generate_new_graph
+from graph import Graph, GraphSync, Edges, Nodes, Node
+from graph_generation import generate_graph, load_graph_map, generate_new_graph, simulate_interactions, simulate_edge_updates
 from graph_inspection import check_graph_mapping, check_id, compare_graphs, compare_edges
 from mongo import MongoHandler
 
@@ -17,10 +17,29 @@ async def main():
     graph_map = load_graph_map()
 
     before = time()
-    graph = Graph(user_id=graph_map['user_id'], id=graph_map['graph']['id'], edges=Edges())
-    generate_graph(graph=graph, graph_map=graph_map['graph'])
+    graph = Graph(user_id=graph_map['user_id'], id=graph_map['graph']['id'], edges=Edges(), root=True)
+    await generate_graph(graph=graph, graph_map=graph_map['graph'])
     after = time()
     print(f"Graph generation took {after-before}s")
+
+    # await simulate_interactions(graph=graph, n=10_000_000)
+
+    await simulate_edge_updates(graph=graph, n=1000, k=100_000)
+
+    before = time()
+    # print(await graph.get_highest_interest_node_at_depth(depth=0))
+    # print(await graph.get_highest_interest_node_at_depth(depth=1))
+    # print(await graph.get_highest_interest_node_at_depth(depth=2))
+    # print(await graph.get_highest_interest_node_chain())
+    edge = await graph.get_best_edge() 
+    print(await edge.get_interaction_strength())
+    after = time()
+
+
+
+    print(f"Fetching of interaction metrics took: {after-before}s")
+
+    return
 
     uri = "mongodb+srv://mimir.kjfum9z.mongodb.net/?authSource=%24external&authMechanism=MONGODB-X509&appName=Mimir"
     mongo_handler = MongoHandler(
@@ -32,6 +51,8 @@ async def main():
         print("Database connection established...")
     else:
         return
+
+    return
 
     # nodes_cleanup = await mongo_handler.cleanup(db_name='Graph', collection_name='Nodes')
     # print(f"Number of documents cleaned from the Nodes collection: {nodes_cleanup}")
