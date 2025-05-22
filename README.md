@@ -52,7 +52,7 @@ Graph is a Python library developed as part of the Mimir autonomous AI agent by 
 
 ## Usage
 
-Below is an example of using the Graph library to model a decision graph for Mimir:
+Below is an example of using the Graph library to model a decision graph:
 
 ```python
 from graph import Graph, Node, Edge
